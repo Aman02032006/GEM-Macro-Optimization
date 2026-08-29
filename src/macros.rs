@@ -1,8 +1,8 @@
 // Word-level hardware macros natively evaluated by GEM.
 //
-// This module is the single source of truth for the three Xilinx primitives we
-// evaluate natively instead of shredding into the AIG: CARRY4, DSP48E2 (the
-// Zenith simplified subset) and SRLC32E. Pin names, bit widths, slot ordering
+// Single source of truth for the three Xilinx primitives evaluated natively
+// rather than shredded into the AIG: CARRY4, DSP48E2 (simplified subset per
+// the problem statement) and SRLC32E. Pin names, bit widths, slot ordering
 // and combinational fan-in all live here so that `aigpdk.rs` (netlist pin
 // typing) and `aig.rs` (graph construction) cannot drift apart.
 //
@@ -100,8 +100,8 @@ pub const SRL_NUM_OUTPUTS: usize = 2;
 impl MacroKind {
     /// Recognise a (possibly mangled) cell type name.
     ///
-    /// Returns `None` for anything that is not one of our macros, so callers
-    /// can fall through to the ordinary AIGPDK cell handling.
+    /// Returns `None` for any cell type that is not an intercepted macro,
+    /// allowing callers to fall through to ordinary AIGPDK cell handling.
     pub fn from_celltype(celltype: &str) -> Option<MacroKind> {
         match celltype {
             "CARRY4" => Some(MacroKind::Carry4),

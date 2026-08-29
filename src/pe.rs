@@ -720,12 +720,12 @@ fn is_chain_start(aig: &AIG, wave: &[usize], l: usize) -> bool {
 
 /// Drive boomerang stages until every pin in `targets` is realized.
 ///
-/// The stock loop was `while !unrealized.is_empty() { build_stage()? }`, which
-/// spins forever if a stage cannot make progress -- the exact failure mode a
-/// macro output introduces, since `place_bit` can only represent AND gates and
-/// will never realize one. We now detect a no-progress round and fail the
-/// partition instead, so `process_partitions` can fall back to a different
-/// clustering rather than hanging the mapper.
+/// The upstream loop (`while !unrealized.is_empty() { build_stage()? }`) spins
+/// forever when a stage cannot make progress -- the failure mode a macro output
+/// introduces, since `place_bit` represents only AND gates and can never
+/// realize one. A no-progress round is detected here and fails the partition,
+/// allowing `process_partitions` to fall back to a different clustering rather
+/// than hanging the mapper.
 fn run_boomerang_stages_until_realized(
     aig: &AIG,
     targets: &mut IndexSet<usize>,
@@ -1177,9 +1177,9 @@ impl Partition {
             // themselves are on hold.
             let mut keep_live = keep_live;
             for leaf in realized_leaves_of(aig, &blocked, &realized_inputs) {
-                // Pending macro outputs sit in realized_inputs too, so they
-                // come back as "leaves" of the blocked cone. Re-arming those
-                // would hand the tree the very pins we just withheld.
+                // Pending macro outputs also reside in realized_inputs and so
+                // are returned as "leaves" of the blocked cone. Re-arming them
+                // would reinstate the pins this pass deliberately withheld.
                 if pending_outputs.contains(&leaf) { continue }
                 keep_live.insert(leaf);
             }

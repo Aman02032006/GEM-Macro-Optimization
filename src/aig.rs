@@ -408,10 +408,10 @@ impl AIG {
             sram.port_r_rd_data[netlistdb.pinnames[pinid].2.unwrap() as usize] = o;
         }
         else if let Some(kind) = MacroKind::from_celltype(celltype) {
-            // A word-level macro output pin. Mirrors the $__RAMGEM_SYNC_ arm:
-            // we mint an AIG pin for the output here and resolve the macro's
-            // *inputs* in the second pass of from_netlistdb, once every pin in
-            // the design has an AIG mapping.
+            // Word-level macro output pin. Mirrors the $__RAMGEM_SYNC_ arm:
+            // an AIG pin is minted for the output here, while macro *inputs*
+            // are resolved in the second pass of from_netlistdb, once every
+            // pin in the design has an AIG mapping.
             //
             // Without this arm the pin falls through to the INV/BUF/AND2 arm
             // below and hits its `unreachable!()`.

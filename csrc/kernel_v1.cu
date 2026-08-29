@@ -30,7 +30,7 @@ void simulate_v1_noninteractive_simple_scan_cuda(
   // rather than time-slicing. Register pressure is what decides this, and the
   // margin is thin by construction -- with -maxrregcount=128 and 256 threads,
   // a block claims 256*128 = 32768 of an SM's 65536 registers, i.e. exactly
-  // 2 blocks/SM, which is exactly the 2x-SM grid usage.md tells you to launch.
+  // 2 blocks/SM, matching the 2x-SM grid size documented in usage.md.
   //
   // So any register growth in the macro phase shows up here as a hard launch
   // failure with an opaque message. Check it up front and say what happened.
