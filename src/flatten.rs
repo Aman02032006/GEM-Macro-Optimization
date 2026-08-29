@@ -4,7 +4,8 @@
 
 use crate::aig::{AIG, EndpointGroup, DriverType};
 use crate::aigpdk::AIGPDK_SRAM_ADDR_WIDTH;
-use crate::pe::{Partition, BOOMERANG_NUM_STAGES};
+use crate::pe::{Partition, BOOMERANG_NUM_STAGES, MacroStage};
+use crate::macros::*;
 use crate::staging::StagedAIG;
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
@@ -94,6 +95,12 @@ pub struct FlattenedScriptV1 {
     pub reg_io_state_size: u32,
     /// the u32 array length for storing SRAMs.
     pub sram_storage_size: u32,
+    /// the u32 array length for storing persistent word-level macro state
+    /// (SRLC32E shift registers, DSP48E2 PREG).
+    ///
+    /// Laid out in block-affinity order like [Self::sram_storage_size], so a
+    /// block's macros occupy one contiguous run.
+    pub macro_storage_size: u32,
     /// expected input AIG pins layout
     pub input_layout: Vec<usize>,
     /// maps from primary outputs, FF:D and SRAM:PORT_R_RD_DATA AIG pins
@@ -157,6 +164,24 @@ fn map_global_read_to_rounds(
     panic!("cannot map global init to any multiples of rounds.");
 }
 
+/// Claim the next free bit position in the shared-state image.
+///
+/// Scanning starts in the hier[1] range (4096..8191). That range is where the
+/// tree writes its level-1 results, and `build_one_boomerang_stage` leaves the
+/// slots it did not need as `usize::MAX`. The macro phase runs *after* the
+/// tree reduction, so overwriting a spare slot there is free: nothing has read
+/// it and the next stage's shuffle addresses it like any other position.
+fn alloc_free_pos(occupancy: &mut Vec<bool>, cursor: &mut usize) -> u16 {
+    let hi = 1usize << BOOMERANG_NUM_STAGES;
+    while *cursor < hi && occupancy[*cursor] { *cursor += 1 }
+    assert!(*cursor < hi,
+            "no free shared-state slot left for a macro output; the partition              needs to be split");
+    occupancy[*cursor] = true;
+    let p = *cursor as u16;
+    *cursor += 1;
+    p
+}
+
 /// temporaries for a part being flattened. will be discarded after built.
 #[derive(Debug, Clone, Default)]
 struct FlatteningPart {
@@ -179,10 +204,37 @@ struct FlatteningPart {
     /// the current (placed) count of duplicate permutes
     cnt_placed_duplicate_permute: u32,
 
+    /// bit position of a state word that is never written by anyone.
+    ///
+    /// The state buffer is zero-initialised and this word has no writer, so it
+    /// reads 0 for the whole simulation. It gives a home to flip-flops whose D
+    /// is a hard constant zero -- see make_inputs_outputs.
+    zero_bit_pos: u32,
     /// the starting offset for FFs, outputs, and SRAM read results.
     state_start: u32,
     /// the starting offset of SRAM storage.
     sram_start: u32,
+
+    /// the number of DSP48E2 endpoints committed by this part.
+    ///
+    /// Only DSPs reach the write-out path: CARRY4 is combinational and
+    /// SRLC32E commits inside its macro phase.
+    num_dsps: u32,
+    /// write-out words used by DSP P ports (2 each, 48 bits).
+    dsp_state_words: u32,
+    /// total u32 words of persistent macro state owned by this part.
+    macro_state_words: u32,
+    /// the starting offset of this part's run in the global macro-state array.
+    ///
+    /// Allocated in block-affinity order, exactly like [Self::sram_start], so
+    /// that the macros a block touches occupy one contiguous run. Without this
+    /// the "coalesced SoA" property is fiction: a block whose macros are
+    /// instances {3, 91, 400} issues three scattered loads instead of one.
+    macro_state_start: u32,
+    /// dense local id assigned to each macro (position in AIG::macros ->
+    /// local index within this part). This is the renumbering that makes the
+    /// per-plane arrays coalesce.
+    macro_local_ids: IndexMap<usize, u32>,
 
     /// the partial permutation instructions for
     /// 1. sram inputs
@@ -273,6 +325,11 @@ impl FlatteningPart {
                             dff.en_iv << 1 | (dff.d_iv & 1),
                             None);
                 },
+                EndpointGroup::Macro(m) => {
+                    self.num_dsps += 1;
+                    self.dsp_state_words += 2;
+                    self.macro_state_words += m.kind.state_words() as u32;
+                },
             }
         }
         self.num_duplicate_writeouts = ((
@@ -281,7 +338,11 @@ impl FlatteningPart {
                 + 31) / 32) as u32;
         self.comb_outputs_activations = comb_outputs_activations;
 
-        self.num_writeouts = self.num_normal_writeouts + self.num_srams + self.num_duplicate_writeouts;
+        // Write-out word layout: [normal][dsp][duplicates][sram]. DSP words go
+        // before the duplicates so the existing sram/duplicate offsets, which
+        // are expressed relative to the end, stay exactly as they were.
+        self.num_writeouts = self.num_normal_writeouts + self.dsp_state_words
+            + self.num_srams + self.num_duplicate_writeouts;
 
         self.after_writeout_pin2pos = self.parts_after_writeouts.iter().enumerate()
             .filter_map(|(i, &pin)| {
@@ -350,7 +411,10 @@ impl FlatteningPart {
         else {
             self.cnt_placed_duplicate_permute += 1;
             let dup_pos = ((self.num_writeouts - self.num_srams) * 32 - self.cnt_placed_duplicate_permute) as usize;
-            let dup_perm_pos = ((self.num_srams * 4 + self.num_duplicate_writeouts) * 32 - self.cnt_placed_duplicate_permute) as usize;
+            // Gather-lane layout: [sram: 4 each][dsp: 4 each][duplicates].
+            let dup_perm_pos = ((self.num_srams * 4 + self.num_dsps * 4
+                + self.num_duplicate_writeouts) * 32
+                - self.cnt_placed_duplicate_permute) as usize;
             if dup_perm_pos >= 8192 {
                 panic!("sram duplicate bit larger than expected..")
                 // dup_perm_pos = 8191;
@@ -387,6 +451,7 @@ impl FlatteningPart {
         self.cnt_placed_duplicate_permute = 0;
 
         let mut cur_sram_id = 0;
+        let mut cur_dsp_id = 0u32;
         for &endpt_i in &part.endpoints {
             match staged.get_endpoint_group(aig, endpt_i) {
                 EndpointGroup::RAMBlock(ram) => {
@@ -444,11 +509,83 @@ impl FlatteningPart {
                     ) as u32;
                     staged_io_map.insert(idx, pos);
                 },
+                EndpointGroup::Macro(m) => {
+                    // DSP48E2 is handled exactly like an SRAM: its inputs are
+                    // gathered through the write-out permutation, the macro
+                    // unit computes P_next, and the 48 result bits land in
+                    // write-out slots that input_map points at, so next
+                    // cycle's global read serves P[k] like any DFF Q.
+                    let dsp_local = (self.num_writeouts - self.num_srams
+                        - self.num_duplicate_writeouts - self.dsp_state_words
+                        + cur_dsp_id * 2) as usize;
+                    let dsp_global = self.state_start + self.num_writeouts
+                        - self.num_srams - self.num_duplicate_writeouts
+                        - self.dsp_state_words + cur_dsp_id * 2;
+
+                    // The macro unit applies CEP and the traced clock enable
+                    // itself, so the write-out gate is unconditional.
+                    let one = self.query_permute_with_pin_iv(1);
+                    for k in 0..48usize {
+                        let pin = m.outputs[DSP_OUT_P + k];
+                        if pin == 0 { continue }
+                        // input_map only. Unlike a DFF, whose D (commit) and
+                        // Q (read) are distinct AIG pins, a DSP has just P --
+                        // so registering it as an output too would claim that
+                        // the freshly committed value is what the current
+                        // cycle's logic observed, which it is not. The
+                        // primary-output endpoint gives P its own write-out
+                        // slot when the design exposes it.
+                        input_map.insert(pin, dsp_global * 32 + k as u32);
+                        self.place_clken_datainv(
+                            dsp_local * 32 + k, one.0, one.1, one.2, 0);
+                    }
+
+                    // 128 gather bits: 121 inputs, the clock enable, and the
+                    // ALU configuration as constants. Encoding the config here
+                    // rather than in metadata keeps it per-instance without a
+                    // second lookup, since a constant is just a permute entry
+                    // with set0 set.
+                    let st = (self.num_srams * 4 * 32 + cur_dsp_id * 128) as usize;
+                    for slot in 0..DSP_NUM_INPUTS {
+                        self.place_sram_duplicate(
+                            st + slot,
+                            self.query_permute_with_pin_iv(m.inputs[slot]));
+                    }
+                    self.place_sram_duplicate(
+                        st + DSP_NUM_INPUTS,
+                        self.query_permute_with_pin_iv(m.clk_en_iv));
+                    let (st_code, preadd) = match m.kind {
+                        MacroKind::Dsp48e2 { state, use_preadder } =>
+                            (state as usize, use_preadder as usize),
+                        _ => panic!("non-DSP macro reached the write-out path"),
+                    };
+                    self.place_sram_duplicate(st + DSP_NUM_INPUTS + 1,
+                        self.query_permute_with_pin_iv(st_code & 1));
+                    self.place_sram_duplicate(st + DSP_NUM_INPUTS + 2,
+                        self.query_permute_with_pin_iv((st_code >> 1) & 1));
+                    self.place_sram_duplicate(st + DSP_NUM_INPUTS + 3,
+                        self.query_permute_with_pin_iv(preadd));
+                    cur_dsp_id += 1;
+                },
                 EndpointGroup::DFF(dff) => {
                     if dff.d_iv == 0 {
-                        clilog::warn!(DFF_CONST_ERR, "dff d_iv has zero, not fully optimized netlist. ignoring the error..");
-                        input_map.insert(dff.q, 0);
+                        // D is a hard constant zero, so Q is zero from the
+                        // first cycle (all state is zero-initialised). Point Q
+                        // at the reserved never-written word.
+                        //
+                        // The stock code mapped it to position 0 instead, which
+                        // is a real PRIMARY INPUT bit -- so such a flop read
+                        // that input's value forever. It only shows up when the
+                        // synthesiser leaves a constant-D flop behind, which it
+                        // legitimately does when it cannot prove the first
+                        // cycle without an init value.
+                        clilog::warn!(DFF_CONST_ERR,
+                            "dff d_iv is constant zero (unoptimized netlist);                              tying Q to the reserved zero word");
+                        input_map.insert(dff.q, self.zero_bit_pos);
                         continue
+                    }
+                    if dff.d_iv == 1 {
+                        panic!("dff d_iv is constant ONE, which has no                                 always-one state position. Re-synthesize with                                 stronger opt, or extend flatten.rs with a                                 reserved ones-word.");
                     }
                     let pos = self.state_start * 32 + self.get_or_place_output_with_activation(
                         dff.d_iv, dff.en_iv
@@ -464,10 +601,98 @@ impl FlatteningPart {
         // println!("test clken_permute: {:?}, wos (w/o sram or dup): {:?}", self.clken_permute, self.parts_after_writeouts);
     }
 
+    /// Emit one mid-partition macro phase.
+    ///
+    /// The section is a fixed `MACRO_MAX_LANES * MACRO_LANE_WORDS` words, so
+    /// the script pointer advances by a constant per phase and one warp covers
+    /// exactly one phase. Unused lanes have the VALID bit clear.
+    ///
+    /// Output positions are allocated here rather than in pe.rs because only
+    /// the flattener knows bit positions; pe.rs knows pins.
+    fn emit_macro_phase(
+        &self,
+        script: &mut Vec<u32>,
+        aig: &AIG,
+        ms: &MacroStage,
+        last_pin2localpos: &mut IndexMap<usize, u16>,
+        occupancy: &mut Vec<bool>,
+        macro_state_off: &IndexMap<usize, u32>,
+    ) {
+        let start = script.len();
+        let mut cursor = 1usize << (BOOMERANG_NUM_STAGES - 1);
+        let mut newly = Vec::<(usize, u16)>::new();
+
+        for lane in 0..MACRO_MAX_LANES {
+            if lane >= ms.num_lanes() {
+                for _ in 0..MACRO_LANE_WORDS { script.push(0) }
+                continue
+            }
+            let ml = &ms.lanes[lane];
+            let m = &aig.macros[ml.macro_i];
+            let kind = m.kind;
+
+            // w0: descriptor
+            let state_off = *macro_state_off.get(&ml.macro_i).unwrap_or(&0);
+            script.push(
+                kind.script_kind_code()
+                | ((ml.chain_start as u32) << MACRO_DESC_CHAIN_START_BIT)
+                | (1u32 << MACRO_DESC_VALID_BIT)
+                | (state_off << MACRO_DESC_STATE_SHIFT)
+            );
+
+            // w1..w5: input codes, defaulting to constant zero
+            let mut codes = [1u16 << MACRO_PERM_CONST_BIT; MACRO_LANE_IN_SLOTS];
+            for slot in 0..kind.num_inputs().min(MACRO_LANE_IN_SLOTS) {
+                // A scanned carry-in is produced by the warp scan and must NOT
+                // be gathered: its driver was never materialised in the tree,
+                // which is the whole point of chaining.
+                if !ml.chain_start && matches!(kind, MacroKind::Carry4)
+                    && slot == C4_IN_CI
+                {
+                    continue
+                }
+                codes[slot] = macro_encode_input(
+                    m.inputs[slot],
+                    |pin| last_pin2localpos.get(&pin).copied());
+            }
+            for w in 0..(MACRO_LANE_IN_SLOTS / 2) {
+                script.push((codes[w * 2] as u32) | ((codes[w * 2 + 1] as u32) << 16));
+            }
+
+            // w6..w9: output positions
+            let mut outs = [MACRO_POS_NONE; MACRO_LANE_OUT_SLOTS];
+            for slot in 0..kind.num_outputs().min(MACRO_LANE_OUT_SLOTS) {
+                let pin = m.outputs[slot];
+                if pin == 0 { continue }
+                if !kind.output_needs_mid_partition_eval(slot) { continue }
+                let pos = alloc_free_pos(occupancy, &mut cursor);
+                outs[slot] = pos;
+                newly.push((pin, pos));
+            }
+            for w in 0..(MACRO_LANE_OUT_SLOTS / 2) {
+                script.push((outs[w * 2] as u32) | ((outs[w * 2 + 1] as u32) << 16));
+            }
+
+            // w10, w11: reserved
+            script.push(0);
+            script.push(0);
+        }
+
+        assert_eq!(script.len() - start, MACRO_MAX_LANES * MACRO_LANE_WORDS,
+                   "macro phase section size drifted from the declared layout");
+
+        // Publish the produced pins so the following stage's shuffle finds
+        // them exactly like any tree result.
+        for (pin, pos) in newly {
+            last_pin2localpos.insert(pin, pos);
+        }
+    }
+
     fn build_script(
         &self, aig: &AIG, part: &Partition,
         input_map: &IndexMap<usize, u32>,
         staged_io_map: &IndexMap<usize, u32>,
+        macro_state_off: &IndexMap<usize, u32>,
     ) -> Vec<u32> {
         let mut script = Vec::<u32>::new();
 
@@ -480,6 +705,26 @@ impl FlatteningPart {
         script.push(self.sram_start);
         script.push(0);   // [6]=num global read rounds, assigned later
         script.push(self.num_duplicate_writeouts);
+        // [8] number of mid-partition macro phases, [9..] one header each.
+        // Slots 8..127 were zero padding in the stock format, so macro-free
+        // designs stay bit-identical to before.
+        script.push(part.macro_stages.len() as u32);
+        // [9] DSP endpoint count, [10] base of this part's DSP state run in
+        // the global macro-state array. build_one records state_macros in
+        // endpoint order and the allocator assigns them contiguously, so a
+        // single base plus 2 words per DSP addresses them all.
+        script.push(self.num_dsps);
+        script.push(part.state_macros.first()
+            .and_then(|mi| macro_state_off.get(mi)).copied().unwrap_or(0));
+        for ms in &part.macro_stages {
+            assert!(ms.num_lanes() <= MACRO_MAX_LANES,
+                    "macro phase has {} lanes, one warp is the cap",
+                    ms.num_lanes());
+            script.push(((ms.after_stage as u32) << 16) | (ms.num_lanes() as u32));
+        }
+        assert!(script.len() <= 128,
+                "{} macro phases overflow the metadata block",
+                part.macro_stages.len());
         // padding
         while script.len() < 128 {
             script.push(0);
@@ -505,10 +750,28 @@ impl FlatteningPart {
         while script.len() < 256 {
             script.push(u32::MAX);
         }
+        // Is this pin produced by a mid-partition macro phase rather than
+        // loaded from global memory? A DSP `P` or SRL `Q31` is a cycle-start
+        // state read and DOES come from the global read like a DFF Q; only
+        // combinational macro outputs (CARRY4 O/CO, SRL Q) are supplied by a
+        // phase and must be skipped here.
+        let is_phase_output = |pin: usize| -> bool {
+            match aig.aigpin2macro.get(&pin) {
+                Some(&mi) => {
+                    let m = &aig.macros[mi];
+                    m.outputs.iter().position(|&p| p == pin)
+                        .map(|slot| m.kind.output_needs_mid_partition_eval(slot))
+                        .unwrap_or(false)
+                },
+                None => false,
+            }
+        };
+
         // read global (256x32)
         let mut inputs_taken = BTreeMap::<u32, u32>::new();
         for &inp in &part.stages[0].hier[0] {
             if inp == usize::MAX { continue }
+            if is_phase_output(inp) { continue }
             match input_map.get(&inp) {
                 Some(&pos) => {
                     *inputs_taken.entry(pos >> 5).or_default() |=
@@ -570,6 +833,7 @@ impl FlatteningPart {
         let mut last_pin2localpos = IndexMap::new();
         for &inp in &part.stages[0].hier[0] {
             if inp == usize::MAX { continue }
+            if is_phase_output(inp) { continue }
             let pos = match input_map.get(&inp) {
                 Some(&pos) => (false, pos),
                 None => (true, *staged_io_map.get(&inp).unwrap())
@@ -577,11 +841,50 @@ impl FlatteningPart {
             last_pin2localpos.insert(inp, *outputpos2localpos.get(&pos).unwrap());
         }
 
+        // Which shared-state bit positions currently hold a live value. The
+        // macro output allocator claims free slots out of this; before the
+        // first stage the live set is whatever the global read phase loaded.
+        let mut occupancy = vec![false; 1 << BOOMERANG_NUM_STAGES];
+        for (_, &pos) in &outputpos2localpos {
+            occupancy[pos as usize] = true;
+        }
+        let mut ph_cursor = 0usize;
+
         // boomerang sections start
         for (bs_i, bs) in part.stages.iter().enumerate() {
+            // A phase with after_stage == bs_i runs BEFORE stage bs_i, so it
+            // is emitted here, while last_pin2localpos still describes the
+            // previous stage's output.
+            while ph_cursor < part.macro_stages.len() &&
+                part.macro_stages[ph_cursor].after_stage == bs_i
+            {
+                self.emit_macro_phase(
+                    &mut script, aig, &part.macro_stages[ph_cursor],
+                    &mut last_pin2localpos, &mut occupancy, macro_state_off);
+                ph_cursor += 1;
+            }
             let bs_perm = bs.hier[0].iter().map(|&pin| {
                 if pin == usize::MAX { 0 }
-                else { *last_pin2localpos.get(&pin).unwrap() }
+                else { match last_pin2localpos.get(&pin) {
+                    Some(&pos) => pos,
+                    None => {
+                        let prod = aig.aigpin2macro.get(&pin).copied();
+                        let sched: Vec<(usize, usize)> = part.macro_stages.iter()
+                            .enumerate()
+                            .filter_map(|(w, ms)| {
+                                if ms.lanes.iter().any(|l| Some(l.macro_i) == prod) {
+                                    Some((w, ms.after_stage))
+                                } else { None }
+                            })
+                            .collect();
+                        panic!(
+                            "stage {} needs aigpin {} (driver {:?}); producing                              macro = {:?}; that macro appears in                              (wave, after_stage) = {:?}; all phases at {:?};                              total stages {}",
+                            bs_i, pin, aig.drivers[pin], prod, sched,
+                            part.macro_stages.iter()
+                                .map(|m| m.after_stage).collect::<Vec<_>>(),
+                            part.stages.len())
+                    }
+                } }
             }).collect::<Vec<_>>();
 
             let mut bs_xora = vec![0u32; NUM_THREADS_V1];
@@ -638,6 +941,21 @@ impl FlatteningPart {
                 if pin == usize::MAX { None }
                 else { Some((pin, i as u16)) }
             }).collect::<IndexMap<_, _>>();
+            // The tree rewrites every bit of the hier[1] range each stage, so
+            // the previous phase's macro outputs are gone by now; occupancy is
+            // rebuilt from the new after array rather than accumulated.
+            occupancy = vec![false; 1 << BOOMERANG_NUM_STAGES];
+            for (i, &pin) in self.afters[bs_i].iter().enumerate() {
+                if pin != usize::MAX { occupancy[i] = true; }
+            }
+        }
+
+        // Phases scheduled after the final boomerang stage.
+        while ph_cursor < part.macro_stages.len() {
+            self.emit_macro_phase(
+                &mut script, aig, &part.macro_stages[ph_cursor],
+                &mut last_pin2localpos, &mut occupancy, macro_state_off);
+            ph_cursor += 1;
         }
 
         // sram worker
@@ -709,8 +1027,13 @@ fn build_flattened_script_v1(
     let num_major_stages = parts_in_stages.len();
 
     let states_start = ((input_layout.len() + 31) / 32) as u32;
-    let mut sum_state_start = states_start;
+    // Reserve one word that no partition ever writes. Zero-initialised and
+    // never committed to, it reads 0 forever, which is exactly what a
+    // constant-zero-D flip-flop's Q needs.
+    let zero_word = states_start;
+    let mut sum_state_start = states_start + 1;
     let mut sum_srams_start = 0;
+    let mut sum_macro_state = 0;
 
     // enumerate all major stages and build them one by one.
 
@@ -766,12 +1089,18 @@ fn build_flattened_script_v1(
 
         // allocate output state positions for all srams,
         // in the order of block affinity.
+        // Allocation walks blocks_parts, not part ids, so every array is laid
+        // out in block-affinity order. This is what makes a warp's accesses
+        // contiguous; allocating in part-id order would scatter them.
         for block in &blocks_parts {
             for &part_id in block {
+                flattening_parts[part_id].zero_bit_pos = zero_word * 32;
                 flattening_parts[part_id].state_start = sum_state_start;
                 sum_state_start += flattening_parts[part_id].num_writeouts;
                 flattening_parts[part_id].sram_start = sum_srams_start;
                 sum_srams_start += flattening_parts[part_id].num_srams * (1 << AIGPDK_SRAM_ADDR_WIDTH);
+                flattening_parts[part_id].macro_state_start = sum_macro_state;
+                sum_macro_state += flattening_parts[part_id].macro_state_words;
             }
         }
 
@@ -790,6 +1119,39 @@ fn build_flattened_script_v1(
         stages_flattening_parts.push(flattening_parts);
     }
 
+    // Global macro-state allocation. An SRLC32E's shift register has no AIG
+    // pin representation, so it lives only here; and its read port may be
+    // scheduled into a different partition than its state commit, which is why
+    // offsets are global rather than partition-relative. Allocation walks
+    // block affinity first so a block's macros stay contiguous.
+    // Macro state is appended to the SRAM buffer rather than living in its
+    // own allocation, so the CUDA kernel needs no extra parameter and the FFI
+    // signature is untouched. Offsets are therefore absolute within that
+    // combined buffer from the start.
+    let mut macro_state_off = IndexMap::<usize, u32>::new();
+    let macro_state_origin = sum_srams_start;
+    let mut macro_state_cursor = macro_state_origin;
+    for (blocks_parts, init_parts) in stages_blocks_parts.iter().zip(
+        parts_in_stages.into_iter().copied()
+    ) {
+        for block in blocks_parts {
+            for &part_id in block {
+                for &macro_i in &init_parts[part_id].state_macros {
+                    if !macro_state_off.contains_key(&macro_i) {
+                        macro_state_off.insert(macro_i, macro_state_cursor);
+                        macro_state_cursor += aig.macros[macro_i].kind.state_words() as u32;
+                    }
+                }
+            }
+        }
+    }
+    for (macro_i, m) in aig.macros.values().enumerate() {
+        if m.kind.has_state() && !macro_state_off.contains_key(&macro_i) {
+            macro_state_off.insert(macro_i, macro_state_cursor);
+            macro_state_cursor += m.kind.state_words() as u32;
+        }
+    }
+
     for ((blocks_parts, flattening_parts), init_parts) in stages_blocks_parts.iter().zip(
         stages_flattening_parts.iter_mut()
     ).zip(
@@ -800,7 +1162,8 @@ fn build_flattened_script_v1(
         for part_id in 0..init_parts.len() {
             // clilog::debug!("building script for part {}", part_id);
             parts_data_split[part_id] = flattening_parts[part_id].build_script(
-                aig, &init_parts[part_id], &input_map, &staged_io_map
+                aig, &init_parts[part_id], &input_map, &staged_io_map,
+                &macro_state_off
             );
         }
 
@@ -838,6 +1201,7 @@ fn build_flattened_script_v1(
         blocks_data: blocks_data.into(),
         reg_io_state_size: sum_state_start,
         sram_storage_size: sum_srams_start,
+        macro_storage_size: macro_state_cursor - macro_state_origin,
         input_layout,
         input_map,
         output_map,

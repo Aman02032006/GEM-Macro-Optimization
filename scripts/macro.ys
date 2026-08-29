@@ -1,0 +1,50 @@
+# Optimized: MIPS with word-level macros intercepted and left intact.
+#
+# Blackbox declarations must be read FIRST so Yosys knows the macro ports and
+# never tries to synthesize into them.
+read_verilog -lib scripts/macros_bb.v
+
+read_verilog -I test_data/MIPS test_data/MIPS/ALU.v test_data/MIPS/RegisterFile.v \
+                                test_data/MIPS/Memory.v test_data/MIPS/Processor.v \
+                                test_data/MIPS/Computer.v
+hierarchy -check -top Computer
+
+proc
+opt_expr
+opt_dff
+opt_clean
+
+# Same async-memory situation as the baseline: map arrays to FFs + mux trees.
+memory -nomap
+memory_map
+opt -full
+
+# --- macro extraction -----------------------------------------------------
+# alumacc gathers +, -, and the comparators into $alu / $lcu cells, which is
+# what the Xilinx carry map recognises. Without this pass the adders are
+# already shredded and there is nothing left to extract.
+alumacc
+opt -full
+
+# $alu / $lcu -> CARRY4. Counter-intuitively LUT_SIZE=6 selects the CARRY4
+# path; LUT_SIZE=4 takes the older MUXCY/XORCY branch instead. Adders
+# narrower than 3 bits fail the map on purpose and stay as ordinary logic.
+techmap -D LUT_SIZE=6 -map +/xilinx/arith_map.v
+opt_clean
+
+# Shift-register chains -> SRLC32E. This design has none, but the pass is kept
+# so the script generalises to designs that do.
+xilinx_srl -variable -minlen 3
+opt_clean
+
+# --- everything else to the AIG PDK ---------------------------------------
+techmap
+opt -full
+
+dfflibmap -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+abc -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+
+write_verilog -noattr -noexpr build/mips_macro.gv
+stat

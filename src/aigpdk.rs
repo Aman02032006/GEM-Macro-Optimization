@@ -5,6 +5,7 @@
 use netlistdb::{Direction, LeafPinProvider};
 use compact_str::CompactString;
 use sverilogparse::SVerilogRange;
+use crate::macros::MacroKind;
 
 /// This implements direction and width providers for
 /// AIG PDK cells.
@@ -61,6 +62,22 @@ impl LeafPinProvider for AIGPDKLeafPins {
              Some(0..=31)) => Direction::O,
 
             _ => {
+                // Natively-evaluated word-level macros (CARRY4, DSP48E2_*,
+                // SRLC32E). Their pin tables live in crate::macros so that
+                // netlist typing and AIG construction share one definition.
+                if let Some(kind) = MacroKind::from_celltype(macro_name.as_str()) {
+                    if let Some(dir) = kind.direction_of(pin_name.as_str(), pin_idx) {
+                        return dir
+                    }
+                    use netlistdb::{GeneralPinName, HierName};
+                    panic!("Macro cell {:?} has no pin {}. Check that the Yosys \
+                            macro-interception pass emits the pin set declared \
+                            in src/macros.rs.",
+                           kind,
+                           (HierName::single(macro_name.clone()),
+                            pin_name, pin_idx).dbg_fmt_pin());
+                }
+
                 use netlistdb::{GeneralPinName, HierName};
                 panic!("Cannot recognize pin type {}, please make sure the verilog netlist is synthesized in GEM's aigpdk.",
                        (HierName::single(macro_name.clone()),
@@ -88,7 +105,15 @@ impl LeafPinProvider for AIGPDKLeafPins {
             ("$__RAMGEM_SYNC_",
              "PORT_W_WR_EN" | "PORT_W_WR_DATA" | "PORT_R_RD_DATA")
                 => Some(SVerilogRange(31, 0)),
-            _ => None
+            _ => {
+                // Word-level macros. Note SVerilogRange is (msb, lsb): the
+                // stock entries above declare a 13-bit bus as (12, 0), so a
+                // 48-bit P port is (47, 0), not (0, 47).
+                if let Some(kind) = MacroKind::from_celltype(macro_name.as_str()) {
+                    return kind.width_of(pin_name.as_str())
+                }
+                None
+            }
         }
     }
 }

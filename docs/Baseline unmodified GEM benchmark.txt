@@ -1,0 +1,151 @@
+aman0@DESKTOP-V7E5ULC:~/projects/GEM Optimization/GEM$ cargo run --release --bin cuda_test --features="cuda" -- test_data/GEMDataset/rocketAIG.gv test_data/GEMDataset/rocket.gemparts test_data/GEMDataset/rocket.median.vcd test_data/GEMDataset/rocket_output.vcd 40
+warning: field `name` is never read
+   --> eda-infra-rs/ulib_zeroable_derive/src/datastructure.rs:144:9
+    |
+132 | pub struct Struct<'a> {
+    |            ------ field in this struct
+...
+144 |     pub name: &'a Ident,
+    |         ^^^^
+    |
+    = note: `Struct` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ulib_zeroable_derive` (lib) generated 1 warning
+warning: gem@0.1.0: nvcc warning : incompatible redefinition for option 'std', the last value of this option was used
+warning: gem@0.1.0: nvcc warning : incompatible redefinition for option 'std', the last value of this option was used
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> eda-infra-rs/netlistdb/src/hier_name.rs:81:17
+   |
+81 |     pub fn iter(&self) -> HierNameRevIter {
+   |                 ^^^^^     ^^^^^^^^^^^^^^^ the same lifetime is hidden here
+   |                 |
+   |                 the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+   = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+   |
+81 |     pub fn iter(&self) -> HierNameRevIter<'_> {
+   |                                          ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> eda-infra-rs/netlistdb/src/hier_name.rs:159:19
+    |
+159 |     fn ident_iter(&self) -> DynIter<&str>;
+    |                   ^^^^^     ^^^^^^^^^^^^^
+    |                   |         |       |
+    |                   |         |       the same lifetime is elided here
+    |                   |         the same lifetime is hidden here
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+159 |     fn ident_iter(&self) -> DynIter<'_, &str>;
+    |                                     +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> eda-infra-rs/netlistdb/src/hier_name.rs:175:19
+    |
+175 |     fn ident_iter(&self) -> DynIter<&str> {
+    |                   ^^^^^     ^^^^^^^^^^^^^
+    |                   |         |       |
+    |                   |         |       the same lifetime is elided here
+    |                   |         the same lifetime is hidden here
+    |                   the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+175 |     fn ident_iter(&self) -> DynIter<'_, &str> {
+    |                                     +++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> eda-infra-rs/vcd-ng/src/lib.rs:394:17
+    |
+394 |     pub fn iter(&self) -> VecValueIter {
+    |                 ^^^^^     ^^^^^^^^^^^^ the same lifetime is hidden here
+    |                 |
+    |                 the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+394 |     pub fn iter(&self) -> VecValueIter<'_> {
+    |                                       ++++
+
+warning: `netlistdb` (lib) generated 3 warnings (run `cargo fix --lib -p netlistdb` to apply 3 suggestions)
+warning: `vcd-ng` (lib) generated 1 warning (run `cargo fix --lib -p vcd-ng` to apply 1 suggestion)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> src/aig.rs:644:31
+    |
+644 |     pub fn get_endpoint_group(&self, endpt_id: usize) -> EndpointGroup {
+    |                               ^^^^^                      ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                               |
+    |                               the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+644 |     pub fn get_endpoint_group(&self, endpt_id: usize) -> EndpointGroup<'_> {
+    |                                                                       ++++
+
+warning: `gem` (lib) generated 1 warning (run `cargo fix --lib -p gem` to apply 1 suggestion)
+   Compiling gem v0.1.0 (/home/aman0/projects/GEM Optimization/GEM)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> src/bin/cuda_test.rs:126:13
+    |
+126 |     fn iter(&self) -> VCDHierRevIter {
+    |             ^^^^^     ^^^^^^^^^^^^^^ the same lifetime is hidden here
+    |             |
+    |             the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+126 |     fn iter(&self) -> VCDHierRevIter<'_> {
+    |                                     ++++
+
+warning: `gem` (bin "cuda_test") generated 1 warning (run `cargo fix --bin "cuda_test" -p gem` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 3.77s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target/release/cuda_test test_data/GEMDataset/rocketAIG.gv test_data/GEMDataset/rocket.gemparts test_data/GEMDataset/rocket.median.vcd test_data/GEMDataset/rocket_output.vcd 40`
+20:52:41 [INFO] Simulator args:
+SimulatorArgs {
+    netlist_verilog: "test_data/GEMDataset/rocketAIG.gv",
+    top_module: None,
+    level_split: [],
+    gemparts: "test_data/GEMDataset/rocket.gemparts",
+    input_vcd: "test_data/GEMDataset/rocket.median.vcd",
+    input_vcd_scope: None,
+    output_vcd: "test_data/GEMDataset/rocket_output.vcd",
+    output_vcd_scope: None,
+    num_blocks: 40,
+    check_with_cpu: false,
+    max_cycles: None,
+}
+20:52:44 [WARN] (NL_SV_NETIO_UNDRIV) There are 3794 nets without driving pins.
+20:52:44 [INFO] inferred clock port clock_uncore (posedge)
+20:52:44 [INFO] inferred clock port jtag_TCK (posedge & negedge)
+20:52:44 [INFO] inferred clock port serial_tl_0_clock_in (posedge)
+20:52:44 [INFO] # of effective partitions in each stage: [32]
+20:52:44 [DEBUG] gem::flatten: [src/flatten.rs:754] major stage 0: max total boomerang depth (w/ cost) 15
+20:52:44 [INFO] Built script for 40 blocks, reg/io state size 3804, sram size 1048576, script size 1917952
+Script hash: 3682488943307834280
+20:52:44 [WARN] (GATESIM_VCDI_MISSING_PI) Primary input port (HierName(), "axi4_mem_0_bits_b_bits_id", Some(3)) not present in the VCD input
+20:52:44 [WARN] (GATESIM_VCDI_MISSING_PI) Primary input port (HierName(), "axi4_mem_0_bits_b_bits_id", Some(2)) not present in the VCD input
+20:52:44 [WARN] (GATESIM_VCDI_MISSING_PI) Primary input port (HierName(), "axi4_mem_0_bits_b_bits_id", Some(1)) not present in the VCD input
+20:52:44 [WARN] (GATESIM_VCDI_MISSING_PI) Primary input port (HierName(), "axi4_mem_0_bits_b_bits_id", Some(0)) not present in the VCD input
+20:52:44 [WARN] (GATESIM_VCDI_MISSING_PI) Primary input port (HierName(), "axi4_mem_0_bits_b_bits_resp", Some(1)) not present in the VCD input
+20:52:44 [WARN] Further warn (GATESIM_VCDI_MISSING_PI) will be suppressed.
+20:52:44 [INFO] skipped output for port axi4_mem_0_clock as it is a pass-through of input port.
+20:52:44 [INFO] skipped output for port clock_tap as it is a pass-through of input port.
+20:52:46 [INFO] total number of cycles: 1
+20:52:47 [DEBUG] TimerStarting: [src/bin/cuda_test.rs:677] simulation
+20:52:47 [DEBUG] TimerFinished: [src/bin/cuda_test.rs:677] simulation, Elapsed=14.526008ms
+20:52:47 [INFO] write out vcd

@@ -1,0 +1,28 @@
+# Macro-rich micro-benchmark -> AIG netlist with all three macros intact.
+read_verilog scripts/macros_behav.v
+read_verilog test_data/macrobench/macro_bench.v
+hierarchy -check -top macro_bench
+
+proc
+opt_expr
+opt_dff
+opt_clean
+
+memory -nomap
+memory_map
+opt -full
+
+# no macro extraction: this is the shredded AIG baseline
+opt -full
+opt_clean
+
+techmap
+opt -full
+
+dfflibmap -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+abc -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+
+write_verilog -noattr -noexpr build/macrobench_base.gv
+stat

@@ -1,0 +1,23 @@
+module top (clk, cyinit, s, di, srl_d, srl_ce, srl_a, o, cout, srl_q, srl_tail);
+    input clk;
+    input cyinit;
+    input [7:0] s;
+    input [7:0] di;
+    input srl_d;
+    input srl_ce;
+    input [4:0] srl_a;
+    output [7:0] o;
+    output cout;
+    output srl_q;
+    output srl_tail;
+
+    wire [3:0] co0; wire [3:0] co1;
+    wire srl0_q31;
+
+    CARRY4 c0 (.CI(1'b0),   .CYINIT(cyinit), .DI(di[3:0]), .S(s[3:0]), .O(o[3:0]), .CO(co0));
+    CARRY4 c1 (.CI(co0[3]), .CYINIT(1'b0),   .DI(di[7:4]), .S(s[7:4]), .O(o[7:4]), .CO(co1));
+    BUF cout_buf (.A(co1[3]), .Y(cout));
+
+    SRLC32E srl0 (.CLK(clk), .D(srl_d),   .CE(srl_ce), .A(srl_a), .Q(srl_q),    .Q31(srl0_q31));
+    SRLC32E srl1 (.CLK(clk), .D(srl0_q31), .CE(srl_ce), .A(srl_a), .Q(srl_tail), .Q31());
+endmodule

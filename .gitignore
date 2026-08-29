@@ -2,3 +2,9 @@
 /Cargo.lock
 /compile_commands.json
 .cache
+/build/
+/test_data/GEMDataset/
+*.gemparts
+*.vcd
+*.deb
+*:Zone.Identifier

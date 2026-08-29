@@ -1,0 +1,16 @@
+module top (ci, s, di, o, co);
+    input ci;
+    input [3:0] s;
+    input [3:0] di;
+    output [3:0] o;
+    output [3:0] co;
+
+    CARRY4 c4 (
+        .CIN    (ci),
+        .CYINIT (1'b0),
+        .DI     (di),
+        .S      (s),
+        .O      (o),
+        .CO     (co)
+    );
+endmodule

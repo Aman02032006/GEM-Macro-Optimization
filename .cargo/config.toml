@@ -1,0 +1,65 @@
+# Build environment for GEM on modern toolchains (Rust 1.93, CUDA 13.x, GCC 15).
+#
+# Applied automatically by cargo for any build run from this directory, so no
+# shell wrapper or exported variables are needed:
+#
+#   cargo build --release --bin cuda_test --features=cuda
+#
+# Nothing here edits the eda-infra-rs submodule or the cargo registry. Both are
+# outside this repository, so changes to them are neither committable nor
+# portable to teammates or the judging machine.
+
+# --- Rust: distro rustc ICE --------------------------------------------------
+# WORKAROUND -- remove once on a rustup toolchain.
+#
+# Ubuntu's packaged rustc 1.93.1 (+dfsg, "built from a source tarball") has a
+# deterministic ICE in the `mismatched_lifetime_syntaxes` lint that kills the
+# vcd-ng build:
+#
+#   thread 'rustc' panicked at library/alloc/src/vec/mod.rs:2796:36:
+#   slice index starts at 31 but ends at 30
+#   #0 [lint_mod] linting top-level module
+#
+# Isolated by bisection: allowing this one lint builds clean, while `-A unused`
+# and an empty RUSTFLAGS both still panic. `--cap-lints allow` also works but
+# silences warnings on our own code too, so it is the worse trade.
+#
+# GEM's usage.md recommends installing rustup, and upstream rustc does not
+# carry the Debian patches implicated here. Prefer that over keeping this.
+
+[env]
+
+# --- C++: GCC 13+ dropped transitive <cstdint> -------------------------------
+# mt-kahypar-sc 0.2.0 relies on <cstdint> arriving transitively, which GCC
+# stopped doing in 13 (Ubuntu 25.10 ships GCC 15). For example
+# mt-kahypar/utils/memory_tree.h declares `enum class OutputType : uint8_t`
+# with no such include, and fails to parse.
+#
+# mt-kahypar is a crates.io dependency vendored under ~/.cargo/registry, so its
+# source cannot be patched portably. Setting CXXFLAGS globally does fix it, but
+# the `cc` crate also forwards CXXFLAGS into nvcc as
+# `-Xcompiler -include -Xcompiler cstdint`, which breaks CUDA compilation with
+# a c++config.h redefinition cascade.
+#
+# `cc` resolves the CUDA compiler from $NVCC and the host C++ compiler from
+# $CXX independently, so overriding only $CXX scopes the fix to the C++ tree
+# and leaves nvcc untouched. Forced, because a stale CXX in the shell would
+# silently reintroduce the mt-kahypar failure. Set GEM_HOST_CXX to use a
+# different underlying compiler.
+CXX = { value = "scripts/gxx-cstdint", relative = true, force = true }
+
+# --- CUDA: architectures ----------------------------------------------------
+# ucc::cl_cuda() defaults to gencode=[80,70] and ptx=50. CUDA 13 dropped
+# Maxwell, Pascal AND Volta, so nvcc 13.3 rejects sm_50, sm_60 and sm_70 --
+# both halves of the default are dead, not just the PTX arch.
+# Verified accepted by nvcc 13.3: sm_75, 80, 86, 89, 90, 100, 120.
+#
+# Not forced, so each machine can override from the shell:
+#   UCC_CUDA_PTX=89 cargo build --release --features=cuda
+#
+# NOTE: cl_cuda() cannot emit multi-arch SASS *and* PTX together -- setting
+# both variables produces `-gencode` alongside `-arch`/`-code`. For a
+# submission fatbin covering the judges' unknown GPU, call ucc::cl_cuda_arch()
+# directly from build.rs instead.
+UCC_CUDA_GENCODE = ""
+UCC_CUDA_PTX = "86"

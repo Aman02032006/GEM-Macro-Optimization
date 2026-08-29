@@ -1,0 +1,87 @@
+module top (
+    clk, gate_en,
+    a_in, b_in, c_in, d_in,
+    s_lo, s_hi, di_lo, di_hi, cyinit,
+    srl_d, srl_ce, srl_addr,
+    sum_lo, sum_hi, carry_out,
+    srl_q, srl_tail,
+    p_out
+);
+    input clk;
+    input gate_en;
+    input [26:0] a_in;
+    input [17:0] b_in;
+    input [47:0] c_in;
+    input [26:0] d_in;
+    input [3:0] s_lo;
+    input [3:0] s_hi;
+    input [3:0] di_lo;
+    input [3:0] di_hi;
+    input cyinit;
+    input srl_d;
+    input srl_ce;
+    input [4:0] srl_addr;
+
+    output [3:0] sum_lo;
+    output [3:0] sum_hi;
+    output carry_out;
+    output srl_q;
+    output srl_tail;
+    output [47:0] p_out;
+
+    wire [3:0] co_lo;
+    wire [3:0] co_hi;
+    wire srl0_q31;
+    wire srl1_q31_unused;
+    wire gated_clk;
+
+    CARRY4 carry_lo (
+        .CI     (1'b0),
+        .CYINIT (cyinit),
+        .DI     (di_lo),
+        .S      (s_lo),
+        .O      (sum_lo),
+        .CO     (co_lo)
+    );
+
+    CARRY4 carry_hi (
+        .CI     (co_lo[3]),
+        .CYINIT (1'b0),
+        .DI     (di_hi),
+        .S      (s_hi),
+        .O      (sum_hi),
+        .CO     (co_hi)
+    );
+
+    BUF carry_out_buf (.A(co_hi[3]), .Y(carry_out));
+
+    CKLNQD dsp_clkgate (.CP(clk), .E(gate_en), .Q(gated_clk));
+
+    DSP48E2_MAC_PREADD dsp0 (
+        .CLK (gated_clk),
+        .A   (a_in),
+        .B   (b_in),
+        .C   (c_in),
+        .D   (d_in),
+        .P   (p_out)
+    );
+
+    SRLC32E srl0 (
+        .CLK (clk),
+        .D   (srl_d),
+        .CE  (srl_ce),
+        .A   (srl_addr),
+        .Q   (srl_q),
+        .Q31 (srl0_q31)
+    );
+
+    SRLC32E srl1 (
+        .CLK (clk),
+        .D   (srl0_q31),
+        .CE  (srl_ce),
+        .A   (srl_addr),
+        .Q   (srl_tail),
+        .Q31 (srl1_q31_unused)
+    );
+
+endmodule

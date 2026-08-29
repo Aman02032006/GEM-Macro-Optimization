@@ -1,0 +1,24 @@
+module top (clk, cyinit, s, di, o, cout, dq);
+    input clk;
+    input cyinit;
+    input [31:0] s;
+    input [31:0] di;
+    output [31:0] o;
+    output cout;
+    output dq;
+
+    wire [3:0] co0; wire [3:0] co1; wire [3:0] co2; wire [3:0] co3;
+    wire [3:0] co4; wire [3:0] co5; wire [3:0] co6; wire [3:0] co7;
+
+    CARRY4 c0 (.CI(1'b0),   .CYINIT(cyinit), .DI(di[3:0]),   .S(s[3:0]),   .O(o[3:0]),   .CO(co0));
+    CARRY4 c1 (.CI(co0[3]), .CYINIT(1'b0),   .DI(di[7:4]),   .S(s[7:4]),   .O(o[7:4]),   .CO(co1));
+    CARRY4 c2 (.CI(co1[3]), .CYINIT(1'b0),   .DI(di[11:8]),  .S(s[11:8]),  .O(o[11:8]),  .CO(co2));
+    CARRY4 c3 (.CI(co2[3]), .CYINIT(1'b0),   .DI(di[15:12]), .S(s[15:12]), .O(o[15:12]), .CO(co3));
+    CARRY4 c4 (.CI(co3[3]), .CYINIT(1'b0),   .DI(di[19:16]), .S(s[19:16]), .O(o[19:16]), .CO(co4));
+    CARRY4 c5 (.CI(co4[3]), .CYINIT(1'b0),   .DI(di[23:20]), .S(s[23:20]), .O(o[23:20]), .CO(co5));
+    CARRY4 c6 (.CI(co5[3]), .CYINIT(1'b0),   .DI(di[27:24]), .S(s[27:24]), .O(o[27:24]), .CO(co6));
+    CARRY4 c7 (.CI(co6[3]), .CYINIT(1'b0),   .DI(di[31:28]), .S(s[31:28]), .O(o[31:28]), .CO(co7));
+
+    BUF cout_buf (.A(co7[3]), .Y(cout));
+    DFF clk_anchor (.CLK(clk), .D(cyinit), .Q(dq));
+endmodule

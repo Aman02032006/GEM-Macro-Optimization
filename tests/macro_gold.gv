@@ -1,0 +1,72 @@
+module top (
+    clk,
+    cyinit, s0, di0, s1, di1,
+    srl_d, srl_ce, srl_a,
+    dsp_a, dsp_b, dsp_c, dsp_d,
+    o0, o1, cout,
+    srl_q, srl_q31,
+    p
+);
+    input clk;
+    input cyinit;
+    input [3:0] s0;
+    input [3:0] di0;
+    input [3:0] s1;
+    input [3:0] di1;
+    input srl_d;
+    input srl_ce;
+    input [4:0] srl_a;
+    input [26:0] dsp_a;
+    input [17:0] dsp_b;
+    input [47:0] dsp_c;
+    input [26:0] dsp_d;
+
+    output [3:0] o0;
+    output [3:0] o1;
+    output cout;
+    output srl_q;
+    output srl_q31;
+    output [47:0] p;
+
+    wire [3:0] co0;
+    wire [3:0] co1;
+
+    CARRY4 c0 (
+        .CI     (1'b0),
+        .CYINIT (cyinit),
+        .DI     (di0),
+        .S      (s0),
+        .O      (o0),
+        .CO     (co0)
+    );
+
+    CARRY4 c1 (
+        .CI     (co0[3]),
+        .CYINIT (1'b0),
+        .DI     (di1),
+        .S      (s1),
+        .O      (o1),
+        .CO     (co1)
+    );
+
+    BUF cout_buf (.A(co1[3]), .Y(cout));
+
+    SRLC32E srl (
+        .CLK (clk),
+        .D   (srl_d),
+        .CE  (srl_ce),
+        .A   (srl_a),
+        .Q   (srl_q),
+        .Q31 (srl_q31)
+    );
+
+    DSP48E2_MAC_PREADD dsp (
+        .CLK (clk),
+        .A   (dsp_a),
+        .B   (dsp_b),
+        .C   (dsp_c),
+        .D   (dsp_d),
+        .P   (p)
+    );
+
+endmodule

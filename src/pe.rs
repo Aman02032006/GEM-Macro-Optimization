@@ -3,6 +3,7 @@
 //! Partition executor
 
 use crate::aig::{DriverType, AIG, EndpointGroup};
+use crate::macros::MacroKind;
 use crate::staging::StagedAIG;
 use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,56 @@ pub struct BoomerangStage {
     pub write_outs: Vec<usize>,
 }
 
+/// One lane of a macro phase: a single macro instance assigned to one GPU
+/// lane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MacroLane {
+    /// position within [crate::aig::AIG::macros].
+    pub macro_i: usize,
+    /// Is this lane the head of a carry chain?
+    ///
+    /// A chain head takes its carry-in from ordinary logic (`CYINIT`, or a
+    /// `CI` driven by something that is not another CARRY4). Every following
+    /// lane takes its carry from the warp scan instead, so its `CI` pin is not
+    /// gathered from `shared_state` at all.
+    pub chain_start: bool,
+}
+
+/// One mid-partition macro evaluation phase.
+///
+/// Sits between two boomerang stages: every macro listed here has all of its
+/// combinational inputs realised by boomerang stage `after_stage - 1`, and its
+/// outputs become realised inputs for stage `after_stage` onwards.
+///
+/// Only macros with combinationally-driven outputs appear here. A DSP48E2 has
+/// none -- its `P` port is a read of `PREG`, loaded during the global read
+/// phase like a DFF `Q` -- so DSPs are scheduled purely as endpoints.
+///
+/// # Why chains, not depth levels
+///
+/// An earlier revision grouped macros into depth waves, which is the natural
+/// dependency order but is badly wrong for carry chains: a 32-bit adder is 8
+/// CARRY4s at 8 successive depths, so it produced 8 phases of one macro each.
+/// Since every script section costs global bandwidth re-read every cycle, that
+/// alone could make the "optimised" simulator slower than stock GEM.
+///
+/// A whole chain now occupies consecutive lanes of ONE phase and the carry is
+/// propagated with a Kogge-Stone `__shfl_up_sync` scan, so the 8-link adder is
+/// a single phase. Phases are ordered by the depth of their *external* inputs,
+/// which is what actually constrains them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MacroStage {
+    /// index into [Partition::stages]: this phase runs immediately before
+    /// that boomerang stage. Equal to `stages.len()` if it runs last.
+    pub after_stage: usize,
+    /// lanes, laid out so that each carry chain is contiguous and ascending.
+    pub lanes: Vec<MacroLane>,
+}
+
+impl MacroStage {
+    pub fn num_lanes(&self) -> usize { self.lanes.len() }
+}
+
 /// One partitioned block: a basic execution unit on GPU.
 ///
 /// A block is mapped to a GPU block with the following resource
@@ -53,6 +104,17 @@ pub struct Partition {
     ///
     /// between stages there will automatically be shuffles.
     pub stages: Vec<BoomerangStage>,
+    /// mid-partition macro evaluation phases, ordered by `after_stage`.
+    ///
+    /// Kept as a parallel list rather than folding into `stages` so that every
+    /// existing consumer of `stages` (flatten.rs, flatten_test.rs, the
+    /// merge heuristics below) keeps working unchanged on macro-free designs.
+    #[serde(default)]
+    pub macro_stages: Vec<MacroStage>,
+    /// positions within [crate::aig::AIG::macros] of the stateful macros this
+    /// partition commits state for, in endpoint order.
+    #[serde(default)]
+    pub state_macros: Vec<usize>,
 }
 
 /// build a single boomerang stage given the current inputs and
@@ -239,9 +301,25 @@ fn build_one_boomerang_stage(
                 lvl1_necessary_nodes.insert(order[order_i]);
             }
             else {
-                let (a, b) = match aig.drivers[order[order_i]] {
-                    DriverType::AndGate(a, b) => (a, b),
-                    _ => panic!()
+                let (a, b) = match &aig.drivers[order[order_i]] {
+                    DriverType::AndGate(a, b) => (*a, *b),
+                    // A macro output can never be placed in the boomerang
+                    // hierarchy: the tree evaluates a fixed 2-input boolean op
+                    // per node, and a CARRY4 is 10-in/8-out. Reaching here
+                    // means the macro was not seeded as a realized input by
+                    // Partition::build_one, so say so rather than panicking
+                    // with no context.
+                    DriverType::Macro(cellid, slot) => panic!(
+                        "macro cell {} output slot {} reached boomerang level \
+                         assignment at level {}. Mid-partition macros must be \
+                         evaluated in a MacroStage and their outputs seeded \
+                         into realized_inputs before any stage consumes them.",
+                        cellid, slot, level[order_i]
+                    ),
+                    d @ _ => panic!(
+                        "unexpected driver {:?} at boomerang level {}",
+                        d, level[order_i]
+                    )
                 };
                 if a >= 2 &&
                     level[*id2order.get(&(a >> 1)).unwrap()] == 0 &&
@@ -406,6 +484,44 @@ fn build_one_boomerang_stage(
          endpoints_lvl1.len() - endpt_lvl1_i >= (32 - spaces[spaces_j].0) as usize)
     {
         let i = spaces[spaces_j].1;
+
+        // Only spend a write-out on a group that actually realizes something.
+        //
+        // The loop condition takes the `endpoints_untouched.is_empty()` branch
+        // whenever every endpoint is level-0 or level-1, and then walks EVERY
+        // 32-slot group in hier[1] -- about 128 of them. Without this check it
+        // pushes a write-out per group even after the last endpoint has been
+        // placed, so two stages burn ~256 write-outs on empty space and the
+        // partition is rejected at the cap no matter how small the design is.
+        //
+        // Macro designs hit this constantly: a macro output is a level-0 leaf,
+        // so nothing is ever "untouched" and the greedy branch is always taken.
+        // A group is worth a write-out if it can receive a pending level-1
+        // endpoint, or if it already holds one that is still unrealized.
+        {
+            let mut free_slots = 0usize;
+            let mut holds_unrealized = false;
+            for j in i..i + 32 {
+                if hier[1][j] == usize::MAX {
+                    free_slots += 1;
+                }
+                else if unrealized_comb_outputs.contains(&hier[1][j])
+                    && !realized_endpoints.contains(&hier[1][j])
+                {
+                    holds_unrealized = true;
+                }
+            }
+            // The placement loop below bails on its first iteration once
+            // endpoints_lvl1 is exhausted, so with nothing pending a group can
+            // neither receive nor mark anything -- the leftovers are picked up
+            // by the endpoints_hier sweep further down instead.
+            let pending = endpt_lvl1_i < endpoints_lvl1.len();
+            if !pending || (free_slots == 0 && !holds_unrealized) {
+                spaces_j += 1;
+                continue
+            }
+        }
+
         for j in i..i + 32 {
             if endpt_lvl1_i >= endpoints_lvl1.len() { break }
             if hier[1][j] == usize::MAX {
@@ -428,7 +544,10 @@ fn build_one_boomerang_stage(
     }
 
     if *total_write_outs > BOOMERANG_MAX_WRITEOUTS - num_reserved_writeouts {
-        clilog::trace!("boomerang: write out overflowed");
+        clilog::warn!(
+            PART_REJECT_WO_COUNT,
+            "partition rejected: boomerang write-outs exhausted              ({} used, {} reserved, cap {})",
+            *total_write_outs, num_reserved_writeouts, BOOMERANG_MAX_WRITEOUTS);
         return None
     }
 
@@ -444,7 +563,10 @@ fn build_one_boomerang_stage(
         while hier[1][hier1_j] != usize::MAX {
             hier1_j += 1;
             if hier1_j >= hier[1].len() {
-                clilog::trace!("boomerang: overflow putting lvl1");
+                clilog::warn!(
+                    PART_REJECT_LVL1,
+                    "partition rejected: boomerang level-1 row full ({} slots)                      while placing necessary nodes -- the logic cone is wider                      than one partition can hold",
+                    hier[1].len());
                 return None
             }
         }
@@ -457,7 +579,10 @@ fn build_one_boomerang_stage(
     while hier[1][hier1_j] != usize::MAX {
         hier1_j += 1;
         if hier1_j >= hier[1].len() {
-            clilog::trace!("boomerang: overflow putting lvl1 (just a zero pin..)");
+            clilog::warn!(
+                PART_REJECT_LVL1_ZERO,
+                "partition rejected: boomerang level-1 row full ({} slots),                  no free slot even for a constant pin",
+                hier[1].len());
             return None
         }
     }
@@ -500,6 +625,375 @@ fn build_one_boomerang_stage(
     })
 }
 
+/// Which targets cannot be built yet because their cone reads a macro output
+/// whose phase has not run?
+///
+/// A boomerang stage works on the whole outstanding target set, not just the
+/// pins the current wave needs. Without this filter an early stage happily
+/// picks up an endpoint whose cone passes through a not-yet-evaluated macro
+/// output, places it as a level-0 passthrough, and then asks flatten.rs for a
+/// shared-state slot that no phase has written -- which is exactly how MIPS
+/// failed with "stage 0 needs aigpin 622" while that macro's phase sat at
+/// after_stage 2.
+///
+/// Taint is propagated forward over one topological order, so this costs a
+/// single traversal per wave rather than a reachability query per target.
+fn targets_blocked_by_pending(
+    aig: &AIG,
+    targets: &IndexSet<usize>,
+    realized_inputs: &IndexSet<usize>,
+    pending: &IndexSet<usize>,
+) -> IndexSet<usize> {
+    if pending.is_empty() { return IndexSet::new() }
+    let order = aig.topo_traverse_generic(
+        Some(&targets.iter().copied().collect()),
+        Some(realized_inputs)
+    );
+    let mut taint = IndexSet::<usize>::new();
+    for &pin in &order {
+        // pending macro outputs sit in realized_inputs, so test them first
+        if pending.contains(&pin) { taint.insert(pin); continue }
+        if realized_inputs.contains(&pin) { continue }
+        let mut t = false;
+        match aig.drivers[pin] {
+            DriverType::AndGate(a, b) => {
+                if (a >> 1) != 0 && taint.contains(&(a >> 1)) { t = true }
+                if (b >> 1) != 0 && taint.contains(&(b >> 1)) { t = true }
+            }
+            DriverType::Macro(cellid, slot) => {
+                if let Some(m) = aig.macros.get(&cellid) {
+                    m.for_each_comb_fanin(slot, |i| {
+                        if taint.contains(&i) { t = true }
+                    });
+                }
+            }
+            _ => {}
+        }
+        if t { taint.insert(pin); }
+    }
+    targets.iter().copied().filter(|p| taint.contains(p)).collect()
+}
+
+/// The already-realized leaves that a deferred target's cone reads.
+///
+/// Withholding a target stops the boomerang from carrying its leaves forward,
+/// so a primary input that only a deferred target needs loses its shared-state
+/// slot -- MIPS failed as "stage 1 needs aigpin 6 (InputPort(3))". Re-arming
+/// these as keep-live pins makes each stage place them as passthroughs, which
+/// is the same mechanism that keeps macro inputs addressable.
+fn realized_leaves_of(
+    aig: &AIG,
+    targets: &IndexSet<usize>,
+    realized_inputs: &IndexSet<usize>,
+) -> IndexSet<usize> {
+    if targets.is_empty() { return IndexSet::new() }
+    let order = aig.topo_traverse_generic(
+        Some(&targets.iter().copied().collect()),
+        Some(realized_inputs)
+    );
+    order.into_iter().filter(|p| realized_inputs.contains(p)).collect()
+}
+
+/// Is lane `l` of a phase the head of its carry chain?
+///
+/// True unless the immediately preceding lane is a CARRY4 whose `CO[3]` drives
+/// this lane's `CI`. Chains are laid out contiguously and ascending by
+/// `order_macro_waves`, so checking the previous lane is sufficient.
+fn is_chain_start(aig: &AIG, wave: &[usize], l: usize) -> bool {
+    if l == 0 { return true }
+    // a warp scan never crosses a 32-lane boundary
+    if l % 32 == 0 { return true }
+    let me = wave[l];
+    let prev = wave[l - 1];
+    if me == usize::MAX || prev == usize::MAX { return true }
+    let m = &aig.macros[me];
+    let p = &aig.macros[prev];
+    if !matches!(m.kind, MacroKind::Carry4) || !matches!(p.kind, MacroKind::Carry4) {
+        return true
+    }
+    let ci_iv = m.inputs[crate::macros::C4_IN_CI];
+    // Linked to the previous lane means this is NOT a chain head: its carry
+    // arrives from the warp scan rather than from shared state.
+    !((ci_iv >> 1) != 0 &&
+      p.outputs[crate::macros::C4_OUT_CO + 3] == (ci_iv >> 1))
+}
+
+/// Drive boomerang stages until every pin in `targets` is realized.
+///
+/// The stock loop was `while !unrealized.is_empty() { build_stage()? }`, which
+/// spins forever if a stage cannot make progress -- the exact failure mode a
+/// macro output introduces, since `place_bit` can only represent AND gates and
+/// will never realize one. We now detect a no-progress round and fail the
+/// partition instead, so `process_partitions` can fall back to a different
+/// clustering rather than hanging the mapper.
+fn run_boomerang_stages_until_realized(
+    aig: &AIG,
+    targets: &mut IndexSet<usize>,
+    required: Option<&IndexSet<usize>>,
+    keep_live: &IndexSet<usize>,
+    realized_inputs: &mut IndexSet<usize>,
+    stages: &mut Vec<BoomerangStage>,
+    total_write_outs: &mut usize,
+    num_reserved_writeouts: usize,
+) -> Option<()> {
+    // `targets` is always the FULL set of pins this partition still owes,
+    // even when only `required` has to be finished before the caller can
+    // continue. That matters: build_one_boomerang_stage decides which level-0
+    // leaves to carry forward from the target set it is given, so handing it a
+    // narrow per-wave set makes it drop leaves that a later round still needs
+    // -- a DFF Q wanted by stage 1 simply vanishes from stage 0's output.
+    loop {
+        let done = match required {
+            Some(req) => req.iter().all(|i| realized_inputs.contains(i)),
+            None => targets.is_empty(),
+        };
+        if done { return Some(()) }
+        let before_targets = targets.len();
+        let before_realized = realized_inputs.len();
+        let before_stages = stages.len();
+
+        let stage = build_one_boomerang_stage(
+            aig, targets, realized_inputs,
+            total_write_outs, num_reserved_writeouts
+        )?;
+        stages.push(stage);
+
+        // Re-arm every macro input whose phase has not run yet. The boomerang
+        // only carries a pin forward while it is still a target, and it drops
+        // each one the moment it is realized -- so an input realized in stage 0
+        // has lost its shared-state slot by the time a phase runs after stage
+        // 2. Re-inserting makes the next stage place it as a passthrough, which
+        // is the same mechanism that keeps a primary input alive across stages.
+        for &i in keep_live {
+            if realized_inputs.contains(&i) {
+                targets.insert(i);
+            }
+        }
+
+        if targets.len() == before_targets &&
+            realized_inputs.len() == before_realized &&
+            stages.len() == before_stages + 1
+        {
+            clilog::error!(
+                "boomerang made no progress with {} pins still unrealized; \
+                 the leading one is aigpin {} driven by {:?}. This usually \
+                 means a node the tree cannot represent (a macro output) was \
+                 not seeded as a realized input.",
+                targets.len(),
+                targets[0], aig.drivers[targets[0]]
+            );
+            return None
+        }
+    }
+}
+
+/// Group the mid-partition macros reachable from `targets` into dependency
+/// waves.
+///
+/// Returns a list of waves; every macro in wave `k` depends only on ordinary
+/// logic and on macros in waves `< k`. Macros whose outputs are pure state
+/// reads never appear, because they need no mid-partition evaluation.
+fn order_macro_waves(
+    aig: &AIG,
+    targets: &IndexSet<usize>,
+    realized_inputs: &IndexSet<usize>,
+) -> Vec<Vec<usize>> {
+    // Collect the macros in the cone of `targets`.
+    let order = aig.topo_traverse_generic(
+        Some(&targets.iter().copied().collect()),
+        Some(realized_inputs)
+    );
+    let mut in_cone = IndexSet::<usize>::new();
+    for &pin in &order {
+        if realized_inputs.contains(&pin) { continue }
+        if let Some(&macro_i) = aig.aigpin2macro.get(&pin) {
+            let m = &aig.macros[macro_i];
+            if m.kind.needs_mid_partition_eval() {
+                in_cone.insert(macro_i);
+            }
+        }
+    }
+    if in_cone.is_empty() {
+        return Vec::new()
+    }
+
+    // depth[m] = 1 + max depth of any macro reachable through m's eval fan-in.
+    // `order` is topological, so a single forward sweep suffices.
+    let mut pin_depth = IndexMap::<usize, usize>::new();
+    let mut macro_depth = IndexMap::<usize, usize>::new();
+    for &pin in &order {
+        if realized_inputs.contains(&pin) {
+            pin_depth.insert(pin, 0);
+            continue
+        }
+        let mut d = 0usize;
+        match aig.drivers[pin] {
+            DriverType::AndGate(a, b) => {
+                if (a >> 1) != 0 {
+                    d = d.max(*pin_depth.get(&(a >> 1)).unwrap_or(&0));
+                }
+                if (b >> 1) != 0 {
+                    d = d.max(*pin_depth.get(&(b >> 1)).unwrap_or(&0));
+                }
+            }
+            DriverType::Macro(cellid, slot) => {
+                if let Some(m) = aig.macros.get(&cellid) {
+                    let mut fanin_depth = 0usize;
+                    m.for_each_comb_fanin(slot, |i| {
+                        fanin_depth = fanin_depth
+                            .max(*pin_depth.get(&i).unwrap_or(&0));
+                    });
+                    // A macro that commits state inside the phase also has to
+                    // wait for its next-state cone. This matters for an SRL
+                    // cascade: `Q31 -> D` is register-to-register, but both
+                    // ends live in a macro phase, and lanes of one phase run
+                    // in parallel on the GPU. Without this the consumer would
+                    // race its producer's write to shared state.
+                    if m.kind.commits_state_in_phase() {
+                        m.for_each_state_fanin(|i| {
+                            fanin_depth = fanin_depth
+                                .max(*pin_depth.get(&i).unwrap_or(&0));
+                        });
+                    }
+                    if m.kind.output_needs_mid_partition_eval(slot) {
+                        // crossing this macro costs one wave
+                        d = fanin_depth + 1;
+                        if let Some(&macro_i) = aig.aigpin2macro.get(&pin) {
+                            let e = macro_depth.entry(macro_i).or_insert(0);
+                            *e = (*e).max(d);
+                        }
+                    } else {
+                        d = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+        pin_depth.insert(pin, d);
+    }
+
+    // Link CARRY4s into chains: an instance whose CI is driven by another
+    // in-cone CARRY4's CO[3] is that instance's successor.
+    let mut succ = IndexMap::<usize, usize>::new();   // macro_i -> next macro_i
+    let mut has_pred = IndexSet::<usize>::new();
+    for &macro_i in &in_cone {
+        let m = &aig.macros[macro_i];
+        if !matches!(m.kind, MacroKind::Carry4) { continue }
+        let ci_iv = m.inputs[crate::macros::C4_IN_CI];
+        if (ci_iv >> 1) == 0 { continue }
+        let Some(&pred_i) = aig.aigpin2macro.get(&(ci_iv >> 1)) else { continue };
+        if !in_cone.contains(&pred_i) { continue }
+        let pred = &aig.macros[pred_i];
+        if !matches!(pred.kind, MacroKind::Carry4) { continue }
+        // only a CO[3] tap continues a chain; any other output is ordinary
+        // combinational fan-out and does not merge the two into one scan.
+        if pred.outputs[crate::macros::C4_OUT_CO + 3] != (ci_iv >> 1) { continue }
+        // a fan-out of CO[3] to two different CARRY4s cannot be one linear
+        // scan; leave the second one to start its own chain.
+        if succ.contains_key(&pred_i) { continue }
+        succ.insert(pred_i, macro_i);
+        has_pred.insert(macro_i);
+    }
+
+    // Fixpoint over macro-to-macro dependencies the pin traversal cannot see.
+    // An SRLC32E `Q31` feeding another SRL's `D` never shows up in the
+    // comb-fanin walk, because `D` is next-state rather than a read port -- so
+    // without this the producer and consumer land in the same phase and race,
+    // since one phase's lanes execute in parallel on the GPU.
+    //
+    // Carry chains are deliberately exempt: a chained `CI` is supplied by the
+    // warp scan, so a chain stays in one phase by design.
+    for &macro_i in &in_cone { macro_depth.entry(macro_i).or_insert(1); }
+    loop {
+        let mut changed = false;
+        for &macro_i in &in_cone {
+            let m = &aig.macros[macro_i];
+            let mut deps = Vec::<usize>::new();
+            m.for_each_eval_fanin(|pin| deps.push(pin));
+            if m.kind.commits_state_in_phase() {
+                m.for_each_state_fanin(|pin| deps.push(pin));
+            }
+            let chained = has_pred.contains(&macro_i);
+            let ci_pin = m.inputs[crate::macros::C4_IN_CI] >> 1;
+            let mut need = *macro_depth.get(&macro_i).unwrap_or(&1);
+            for pin in deps {
+                if chained && matches!(m.kind, MacroKind::Carry4) && pin == ci_pin {
+                    continue
+                }
+                if let Some(&prod) = aig.aigpin2macro.get(&pin) {
+                    if prod != macro_i && in_cone.contains(&prod) {
+                        need = need.max(*macro_depth.get(&prod).unwrap_or(&1) + 1);
+                    }
+                }
+            }
+            if need > *macro_depth.get(&macro_i).unwrap_or(&1) {
+                macro_depth.insert(macro_i, need);
+                changed = true;
+            }
+        }
+        if !changed { break }
+    }
+
+    // Walk each chain from its head, and key the chain by the depth of its
+    // external inputs -- the head's depth, since every later link's carry
+    // comes from the scan rather than from the graph.
+    let mut chains: Vec<(usize, Vec<usize>)> = Vec::new();
+    for &macro_i in &in_cone {
+        if has_pred.contains(&macro_i) { continue }
+        let mut chain = vec![macro_i];
+        let mut cur = macro_i;
+        while let Some(&next) = succ.get(&cur) {
+            // A warp scan is 32 lanes wide; split longer chains.
+            if chain.len() == crate::macros::MACRO_MAX_LANES { break }
+            chain.push(next);
+            cur = next;
+        }
+        let depth = *macro_depth.get(&macro_i).unwrap_or(&1);
+        chains.push((depth, chain));
+    }
+    // Any chain link beyond a 32-lane split still needs scheduling; pick it up
+    // as its own chain head on a later pass.
+    let mut placed = IndexSet::<usize>::new();
+    for (_, c) in &chains { for &m in c { placed.insert(m); } }
+    for &macro_i in &in_cone {
+        if placed.contains(&macro_i) { continue }
+        let mut chain = vec![macro_i];
+        let mut cur = macro_i;
+        while let Some(&next) = succ.get(&cur) {
+            if chain.len() == crate::macros::MACRO_MAX_LANES || placed.contains(&next) { break }
+            chain.push(next);
+            cur = next;
+        }
+        for &m in &chain { placed.insert(m); }
+        let depth = *macro_depth.get(&macro_i).unwrap_or(&1);
+        chains.push((depth, chain));
+    }
+
+    // Group chains into phases by external-input depth, so independent chains
+    // at the same depth share one phase and one script section.
+    // A phase is capped at one warp, so a chain never straddles a shuffle
+    // boundary and the section size is simply lanes * MACRO_LANE_WORDS.
+    // Chains are themselves capped at MACRO_MAX_LANES above, so every chain
+    // fits in a fresh wave.
+    chains.sort_by_key(|(d, c)| (*d, c[0]));
+    let mut waves: Vec<Vec<usize>> = Vec::new();
+    let mut cur_depth = usize::MAX;
+    for (d, chain) in chains {
+        let need_new = match waves.last() {
+            None => true,
+            Some(w) => d != cur_depth ||
+                w.len() + chain.len() > crate::macros::MACRO_MAX_LANES,
+        };
+        if need_new {
+            waves.push(Vec::new());
+            cur_depth = d;
+        }
+        waves.last_mut().unwrap().extend(chain);
+    }
+    waves.retain(|w| !w.is_empty());
+    waves
+}
+
 impl Partition {
     /// build one partition given a set of endpoints to realize.
     ///
@@ -514,6 +1008,9 @@ impl Partition {
         let mut realized_inputs = staged.primary_inputs.as_ref()
             .cloned().unwrap_or_default();
         let mut num_srams = 0;
+        let mut state_macros = Vec::new();
+        let mut macro_input_words = 0usize;
+        let mut macro_state_words = 0usize;
         let mut comb_outputs_activations = IndexMap::<usize, IndexSet<usize>>::new();
         for &endpt_i in endpoints {
             let edg = staged.get_endpoint_group(aig, endpt_i);
@@ -530,6 +1027,18 @@ impl Partition {
                 EndpointGroup::RAMBlock(_) => {
                     num_srams += 1;
                 },
+                EndpointGroup::Macro(m) => {
+                    // A stateful macro reserves permute words to gather its
+                    // next-state inputs and words to commit its wide state,
+                    // exactly as an SRAM reserves 4 permute words.
+                    macro_input_words += m.kind.input_words();
+                    macro_state_words += m.kind.state_words();
+                    if let Some(&pin) = m.outputs.iter().find(|&&p| p != 0) {
+                        if let Some(&macro_i) = aig.aigpin2macro.get(&pin) {
+                            state_macros.push(macro_i);
+                        }
+                    }
+                },
                 EndpointGroup::StagedIOPin(pin) => {
                     comb_outputs_activations.entry(pin).or_default().insert(2);
                 },
@@ -538,26 +1047,191 @@ impl Partition {
         let num_output_dups = comb_outputs_activations.iter()
             .map(|(_, ckens)| ckens.len() - 1)
             .sum::<usize>();
-        let num_reserved_writeouts = num_srams + (num_output_dups + 31) / 32;
+        let num_reserved_writeouts =
+            num_srams + macro_state_words + (num_output_dups + 31) / 32;
         if num_reserved_writeouts >= BOOMERANG_MAX_WRITEOUTS ||
-            num_srams * 4 + num_output_dups > BOOMERANG_MAX_WRITEOUTS
+            num_srams * 4 + macro_input_words + num_output_dups
+                > BOOMERANG_MAX_WRITEOUTS
         {
-            // overflowed writeout
+            clilog::warn!(
+                PART_REJECT_WRITEOUT,
+                "partition rejected on the write-out budget (cap {}):                  reserved={} (srams {} + macro_state {} + dup_words {}),                  gather_lanes={} (srams*4 {} + macro_inputs {} + dups {}),                  {} endpoints",
+                BOOMERANG_MAX_WRITEOUTS,
+                num_reserved_writeouts, num_srams, macro_state_words,
+                (num_output_dups + 31) / 32,
+                num_srams * 4 + macro_input_words + num_output_dups,
+                num_srams * 4, macro_input_words, num_output_dups,
+                endpoints.len()
+            );
             return None
         }
-        let mut stages = Vec::<BoomerangStage>::new();
-        let mut total_write_outs = 0;
-        while !unrealized_comb_outputs.is_empty() {
-            let stage = build_one_boomerang_stage(
-                aig, &mut unrealized_comb_outputs,
-                &mut realized_inputs, &mut total_write_outs,
-                num_reserved_writeouts
-            )?;
-            stages.push(stage);
+
+        // Every macro output that is a pure state read (DSP `P`, SRL `Q31`) is
+        // available from the global macro-state array at cycle start, exactly
+        // like a DFF `Q`. Seeding them as realised inputs is what stops the
+        // boomerang traversal from trying to descend into a macro, which
+        // place_bit cannot represent.
+        for m in aig.macros.values() {
+            for pin in m.cycle_start_outputs() {
+                realized_inputs.insert(pin);
+            }
         }
+
+        // Order the mid-partition macros into waves. Wave 0 macros depend only
+        // on ordinary logic; wave k macros consume a wave k-1 macro output.
+        // A CARRY4 carry chain of n links yields n waves, each collapsing to a
+        // single macro phase rather than a whole major stage -- which is the
+        // entire point of doing this in-partition.
+        let macro_waves = order_macro_waves(aig, &unrealized_comb_outputs, &realized_inputs);
+
+        let mut stages = Vec::<BoomerangStage>::new();
+        let mut macro_stages = Vec::<MacroStage>::new();
+        let mut total_write_outs = 0;
+
+        // Realise each macro wave's inputs, then evaluate the wave, then move
+        // on. The endpoint cone is realised last.
+        // Every mid-partition macro output is a graph LEAF in every round:
+        // the boomerang tree can never compute one, so it must not appear as a
+        // target before its phase has run. Without this, round 0 happily tries
+        // to pass through a CARRY4 CO[3] that nothing has produced yet.
+        // Mid-partition macro outputs are seeded into realized_inputs up
+        // front. This is load-bearing and NOT the cause of the MIPS ordering
+        // bug: without it the boomerang traversal descends into a macro's
+        // combinational fan-in, the macro node lands at level 0 anyway (its
+        // driver is not an AndGate), and compute_lvl1_necessary_nodes places it
+        // as a passthrough in whatever stage first reaches it -- which then
+        // asks for a shared-state slot no phase has written. Removing the seed
+        // was measured to break every previously-green netlist, not just MIPS.
+        //
+        // They are still withheld from all_targets until their phase runs, so
+        // the tree never tries to *compute* one.
+        let mut pending_outputs = IndexSet::<usize>::new();
+        for wave in &macro_waves {
+            for &macro_i in wave {
+                if macro_i == usize::MAX { continue }
+                for pin in aig.macros[macro_i].mid_partition_outputs() {
+                    realized_inputs.insert(pin);
+                    pending_outputs.insert(pin);
+                }
+            }
+        }
+        let endpoint_targets = unrealized_comb_outputs.clone();
+
+        // One shared target set for the whole partition; waves only choose
+        // WHEN a subset must be finished, never what is in flight.
+        let mut all_targets = unrealized_comb_outputs.iter().copied()
+            .filter(|i| !pending_outputs.contains(i))
+            .collect::<IndexSet<_>>();
+        let mut wave_reqs: Vec<IndexSet<usize>> = Vec::new();
+        for wave in &macro_waves {
+            let mut wave_inputs = IndexSet::new();
+            for (l, &macro_i) in wave.iter().enumerate() {
+                if macro_i == usize::MAX { continue }
+                let m = &aig.macros[macro_i];
+                // The carry-in of a non-head chain link is supplied by the
+                // warp scan, not gathered from shared_state, so it must not be
+                // demanded as a realised input -- doing so would force the
+                // predecessor's CO[3] to be materialised in the tree and
+                // defeat the whole point of scanning.
+                let scanned_ci = !is_chain_start(aig, wave, l);
+                // A macro that commits its own state in the phase needs its
+                // next-state cone realised by then as well, not just the
+                // combinational read cone.
+                let state_slots = if m.kind.commits_state_in_phase() {
+                    m.kind.state_fanin()
+                } else { Vec::new() };
+                for slot in 0..m.kind.num_inputs() {
+                    if scanned_ci && slot == crate::macros::C4_IN_CI { continue }
+                    if !state_slots.contains(&slot) &&
+                        !(0..m.kind.num_outputs()).any(|o|
+                            m.kind.output_needs_mid_partition_eval(o) &&
+                            m.kind.comb_fanin_of_output(o).contains(&slot))
+                    {
+                        continue
+                    }
+                    let iv = m.inputs[slot];
+                    if (iv >> 1) != 0 && !realized_inputs.contains(&(iv >> 1)) {
+                        wave_inputs.insert(iv >> 1);
+                    }
+                }
+            }
+            for &i in &wave_inputs { all_targets.insert(i); }
+            wave_reqs.push(wave_inputs);
+        }
+
+        for (wi, wave) in macro_waves.iter().enumerate() {
+            // Inputs of this wave and every wave still to come must stay
+            // addressable until their phase consumes them.
+            let keep_live = wave_reqs[wi..].iter()
+                .flat_map(|r| r.iter().copied())
+                .collect::<IndexSet<_>>();
+            let req = wave_reqs[wi].clone();
+            for &i in &keep_live {
+                if !realized_inputs.contains(&i) { all_targets.insert(i); }
+            }
+            // Hold back anything that would read a macro output this wave (or
+            // a later one) has not produced yet; it is restored below.
+            let blocked = targets_blocked_by_pending(
+                aig, &all_targets, &realized_inputs, &pending_outputs);
+            // Their leaves must stay addressable even though the targets
+            // themselves are on hold.
+            let mut keep_live = keep_live;
+            for leaf in realized_leaves_of(aig, &blocked, &realized_inputs) {
+                // Pending macro outputs sit in realized_inputs too, so they
+                // come back as "leaves" of the blocked cone. Re-arming those
+                // would hand the tree the very pins we just withheld.
+                if pending_outputs.contains(&leaf) { continue }
+                keep_live.insert(leaf);
+            }
+            for b in &blocked { all_targets.swap_remove(b); }
+            let r = run_boomerang_stages_until_realized(
+                aig, &mut all_targets, Some(&req), &keep_live,
+                &mut realized_inputs,
+                &mut stages, &mut total_write_outs, num_reserved_writeouts
+            );
+            for &b in &blocked {
+                if !realized_inputs.contains(&b) { all_targets.insert(b); }
+            }
+            r?;
+            macro_stages.push(MacroStage {
+                after_stage: stages.len(),
+                lanes: wave.iter().enumerate()
+                    .filter(|(_, &m)| m != usize::MAX)
+                    .map(|(l, &macro_i)| MacroLane {
+                        macro_i,
+                        chain_start: is_chain_start(aig, wave, l),
+                    })
+                    .collect(),
+            });
+            // The phase has now produced these, so an output that is itself
+            // an endpoint input becomes a legal target: the final round will
+            // place it as a passthrough so it gets a write-out slot.
+            for &macro_i in wave {
+                if macro_i == usize::MAX { continue }
+                for pin in aig.macros[macro_i].mid_partition_outputs() {
+                    pending_outputs.swap_remove(&pin);
+                    if endpoint_targets.contains(&pin) {
+                        all_targets.insert(pin);
+                    }
+                }
+            }
+        }
+
+        // Finish everything still outstanding. Macro outputs are deliberately
+        // still in here: one that directly drives an endpoint (a CARRY4 `O`
+        // bit wired to a primary output) has a value but no write-out slot, so
+        // the boomerang places it as a level-0 passthrough -- the same
+        // mechanism that already handles a primary input feeding an output.
+        run_boomerang_stages_until_realized(
+            aig, &mut all_targets, None, &IndexSet::new(), &mut realized_inputs,
+            &mut stages, &mut total_write_outs, num_reserved_writeouts
+        )?;
+
         Some(Partition {
             endpoints: endpoints.clone(),
-            stages
+            stages,
+            macro_stages,
+            state_macros,
         })
     }
 }
@@ -693,8 +1367,14 @@ pub fn process_partitions(
             if !merged { break }
         }
 
-        clilog::info!("part {}: #stages {}",
-                      i, partition_self.stages.len());
+        clilog::info!("part {}: #stages {}, #macro-waves {} ({} macros) at {:?}, #state-macros {}",
+                      i, partition_self.stages.len(),
+                      partition_self.macro_stages.len(),
+                      partition_self.macro_stages.iter()
+                          .map(|ms| ms.num_lanes()).sum::<usize>(),
+                      partition_self.macro_stages.iter()
+                          .map(|ms| ms.after_stage).collect::<Vec<_>>(),
+                      partition_self.state_macros.len());
         effective_parts.push(partition_self);
     }
     effective_parts.sort_by_key(|p| usize::MAX - p.stages.len());

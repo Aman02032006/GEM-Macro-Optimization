@@ -1,0 +1,40 @@
+# Baseline: MIPS -> pure AIG netlist, no word-level macros.
+# This is the reference GEM maps and simulates for the Deliverable D comparison.
+
+read_verilog -I test_data/MIPS test_data/MIPS/ALU.v test_data/MIPS/RegisterFile.v \
+                                test_data/MIPS/Memory.v test_data/MIPS/Processor.v \
+                                test_data/MIPS/Computer.v
+hierarchy -check -top Computer
+
+# generic RTL cleanup
+proc
+opt_expr
+opt_dff
+opt_clean
+
+# Every array in this design has an ASYNCHRONOUS read port:
+#   Memory.Mem[0:255]      word_out = Mem[address]      (combinational)
+#   RegisterFile.regfile   read_data = regfile[addr]    (combinational)
+#   Processor.io_reg[0:3]  io_regN   = io_reg[N]        (combinational)
+# GEM's SRAM primitive is synchronous-read only, and aigpdk.rs panics outright
+# on $__RAMGEM_ASYNC_. So memories are mapped to flip-flops and mux trees with
+# memory_map rather than memory_libmap. That is the documented fallback in
+# usage.md for small async arrays.
+memory -nomap
+memory_map
+opt -full
+
+# flatten everything into 2-input logic
+techmap
+opt -full
+
+# map to the AIG process kit
+dfflibmap -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+abc -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+
+# sverilogparse rejects // comments and attribute pragmas, so keep the output
+# bare.
+write_verilog -noattr -noexpr build/mips_baseline.gv
+stat

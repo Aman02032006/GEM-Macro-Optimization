@@ -7,6 +7,7 @@
 use netlistdb::{NetlistDB, GeneralPinName, Direction};
 use indexmap::{IndexMap, IndexSet};
 use crate::aigpdk::AIGPDK_SRAM_ADDR_WIDTH;
+use crate::macros::{MacroInst, MacroKind};
 
 /// A DFF.
 #[derive(Debug, Default, Clone)]
@@ -50,6 +51,16 @@ pub enum EndpointGroup<'i> {
     PrimaryOutput(usize),
     DFF(&'i DFF),
     RAMBlock(&'i RAMBlock),
+    /// A stateful word-level macro (DSP48E2 `PREG`, SRLC32E shift register).
+    ///
+    /// The task is to compute the next state and commit it under the macro's
+    /// clock enable, exactly like a DFF -- the difference is only that the
+    /// state is 32 or 48 bits wide and lives in the global macro-state array
+    /// rather than in a write-out slot.
+    ///
+    /// Purely combinational macros (CARRY4) are NOT endpoints; they are
+    /// evaluated mid-partition, see [crate::pe::MacroStage].
+    Macro(&'i MacroInst),
     StagedIOPin(usize),
 }
 
@@ -78,6 +89,13 @@ impl EndpointGroup<'_> {
                     f(ram.port_w_wr_data_iv[i] >> 1);
                 }
             },
+            Self::Macro(m) => {
+                // Only the next-state cone, plus the clock enable. The
+                // SRLC32E read address is deliberately excluded: it drives the
+                // combinational read port, not the shift, so requiring it here
+                // would impose a false ordering constraint on the commit.
+                m.for_each_state_fanin(|i| f_nz(i));
+            },
             Self::StagedIOPin(idx) => f(idx),
         }
     }
@@ -101,6 +119,15 @@ pub enum DriverType {
     DFF(usize),
     /// Driven by a 13-bit by 32-bit RAM block (with its index)
     SRAM(usize),
+    /// Driven by an output of a word-level macro (cell id, output slot).
+    ///
+    /// Unlike [DriverType::AndGate] the fan-in is not stored inline: look the
+    /// instance up in [AIG::macros] and consult
+    /// [crate::macros::MacroKind::comb_fanin_of_output] for the slot, because
+    /// the combinational dependency is per-output, not per-cell. A CARRY4
+    /// `O[0]` does not depend on `S[3]`, and a DSP `P` bit depends on nothing
+    /// at all in the current cycle.
+    Macro(usize, usize),
     /// Tie0: tied to zero. Only the 0-th aig pin is allowed to have this.
     Tie0
 }
@@ -140,6 +167,14 @@ pub struct AIG {
     pub dffs: IndexMap<usize, DFF>,
     /// The SRAMs, indexed by cell id
     pub srams: IndexMap<usize, RAMBlock>,
+    /// The natively-evaluated word-level macros, indexed by cell id.
+    pub macros: IndexMap<usize, MacroInst>,
+    /// Positions within [Self::macros] of the macros that carry clocked state
+    /// and therefore appear as endpoint groups. Sorted ascending.
+    pub stateful_macros: Vec<usize>,
+    /// Reverse map: AIG pin -> position within [Self::macros] of the macro
+    /// that drives it. Only populated for macro output pins.
+    pub aigpin2macro: IndexMap<usize, usize>,
     /// The fanout CSR start array.
     pub fanouts_start: Vec<usize>,
     /// The fanout CSR array.
@@ -372,6 +407,31 @@ impl AIG {
             let sram = self.srams.entry(cellid).or_default();
             sram.port_r_rd_data[netlistdb.pinnames[pinid].2.unwrap() as usize] = o;
         }
+        else if let Some(kind) = MacroKind::from_celltype(celltype) {
+            // A word-level macro output pin. Mirrors the $__RAMGEM_SYNC_ arm:
+            // we mint an AIG pin for the output here and resolve the macro's
+            // *inputs* in the second pass of from_netlistdb, once every pin in
+            // the design has an AIG mapping.
+            //
+            // Without this arm the pin falls through to the INV/BUF/AND2 arm
+            // below and hits its `unreachable!()`.
+            let pinname = netlistdb.pinnames[pinid].1.as_str();
+            let pinbit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+            let slot = match kind.output_slot(pinname, pinbit) {
+                Some(slot) => slot,
+                None => panic!(
+                    "Macro cell {} ({:?}) drives pin {}, which is not one of \
+                     its declared outputs. See src/macros.rs.",
+                    netlistdb.celltypes[cellid], kind,
+                    netlistdb.pinnames[pinid].dbg_fmt_pin()
+                )
+            };
+            let o = self.add_aigpin(DriverType::Macro(cellid, slot));
+            self.pin2aigpin_iv[pinid] = o << 1;
+            self.macros.entry(cellid)
+                .or_insert_with(|| MacroInst::new(kind))
+                .outputs[slot] = o;
+        }
         else if celltype == "CKLNQD" {
             let mut prev_cp = usize::MAX;
             let mut prev_en = usize::MAX;
@@ -447,8 +507,17 @@ impl AIG {
         };
 
         for cellid in 1..netlistdb.num_cells {
-            if !matches!(netlistdb.celltypes[cellid].as_str(),
-                         "DFF" | "DFFSR" | "$__RAMGEM_SYNC_") {
+            let celltype = netlistdb.celltypes[cellid].as_str();
+            // Clocked word-level macros (DSP48E2_* via PREG, SRLC32E via the
+            // shift register) participate in the same global clock domain as
+            // DFFs, so their CLK pins must be pre-traced here too -- otherwise
+            // their clock flag AIG pins are never created and the second pass
+            // below asserts. CARRY4 is combinational and has no CLK.
+            let is_clocked_macro = MacroKind::from_celltype(celltype)
+                .map(|k| k.has_clock()) == Some(true);
+            if !matches!(celltype, "DFF" | "DFFSR" | "$__RAMGEM_SYNC_") &&
+                !is_clocked_macro
+            {
                 continue
             }
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
@@ -565,39 +634,135 @@ impl AIG {
                 }
                 *aig.srams.get_mut(&cellid).unwrap() = sram;
             }
+            else if let Some(kind) = MacroKind::from_celltype(
+                netlistdb.celltypes[cellid].as_str()
+            ) {
+                // Resolve macro inputs now that every pin has an AIG mapping.
+                // A macro whose outputs are all unused was never reached by the
+                // DFS and has no entry; it is dead logic, so skip it.
+                if !aig.macros.contains_key(&cellid) {
+                    use netlistdb::GeneralHierName;
+                    clilog::debug!(
+                        "macro cell {} ({:?}) has no used outputs, skipping",
+                        netlistdb.cellnames[cellid].dbg_fmt_hier(), kind
+                    );
+                    continue
+                }
+                let mut inputs = (0..kind.num_inputs())
+                    .map(|s| kind.default_input(s))
+                    .collect::<Vec<_>>();
+                let mut clk_en_iv = 1;
+                for pinid in netlistdb.cell2pin.iter_set(cellid) {
+                    let pinname = netlistdb.pinnames[pinid].1.as_str();
+                    let pinbit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+                    if kind.has_clock() && pinname == "CLK" {
+                        clk_en_iv = aig.trace_clock_pin(
+                            netlistdb, pinid, false, false
+                        ).unwrap();
+                        continue
+                    }
+                    if let Some(slot) = kind.input_slot(pinname, pinbit) {
+                        inputs[slot] = aig.pin2aigpin_iv[pinid];
+                    }
+                }
+                let m = aig.macros.get_mut(&cellid).unwrap();
+                m.inputs = inputs;
+                m.clk_en_iv = clk_en_iv;
+            }
         }
 
-        aig.fanouts_start = vec![0; aig.num_aigpins + 2];
-        for (_i, driver) in aig.drivers.iter().enumerate() {
-            if let DriverType::AndGate(a, b) = *driver {
-                if (a >> 1) != 0 {
-                    aig.fanouts_start[a >> 1] += 1;
-                }
-                if (b >> 1) != 0 {
-                    aig.fanouts_start[b >> 1] += 1;
+        // Index the macros: which are endpoints, and which AIG pin each output
+        // belongs to. Both are needed before the fanout CSR is built.
+        for (macro_i, (_cellid, m)) in aig.macros.iter().enumerate() {
+            if m.kind.is_endpoint() {
+                aig.stateful_macros.push(macro_i);
+            }
+            for &o in &m.outputs {
+                if o != 0 {
+                    aig.aigpin2macro.insert(o, macro_i);
                 }
             }
+        }
+
+        // Fanout CSR. Historically only AndGate contributed edges; macro
+        // outputs now do too, otherwise anything walking fanouts (staging's
+        // liveness counting, repcut) sees a macro's inputs as dead and prunes
+        // nodes that are still needed.
+        //
+        // The edge set is per-output, matching topo_traverse_generic: a DSP
+        // `P` bit contributes nothing (it is a state read), while a CARRY4
+        // `O[i]` contributes only its triangular slice of `S`/`DI`.
+        fn for_each_fanin(
+            drivers: &Vec<DriverType>,
+            macros: &IndexMap<usize, MacroInst>,
+            i: usize,
+            mut f: impl FnMut(usize)
+        ) {
+            match drivers[i] {
+                DriverType::AndGate(a, b) => {
+                    if (a >> 1) != 0 { f(a >> 1) }
+                    if (b >> 1) != 0 { f(b >> 1) }
+                }
+                DriverType::Macro(cellid, slot) => {
+                    if let Some(m) = macros.get(&cellid) {
+                        m.for_each_comb_fanin(slot, f);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut fanouts_start = vec![0usize; aig.num_aigpins + 2];
+        for i in 0..aig.drivers.len() {
+            for_each_fanin(&aig.drivers, &aig.macros, i, |src| {
+                fanouts_start[src] += 1;
+            });
         }
         for i in 1..aig.num_aigpins + 2 {
-            aig.fanouts_start[i] += aig.fanouts_start[i - 1];
+            fanouts_start[i] += fanouts_start[i - 1];
         }
-        aig.fanouts = vec![0; aig.fanouts_start[aig.num_aigpins + 1]];
-        for (i, driver) in aig.drivers.iter().enumerate() {
-            if let DriverType::AndGate(a, b) = *driver {
-                if (a >> 1) != 0 {
-                    let st = aig.fanouts_start[a >> 1] - 1;
-                    aig.fanouts_start[a >> 1] = st;
-                    aig.fanouts[st] = i;
-                }
-                if (b >> 1) != 0 {
-                    let st = aig.fanouts_start[b >> 1] - 1;
-                    aig.fanouts_start[b >> 1] = st;
-                    aig.fanouts[st] = i;
+        let mut fanouts = vec![0usize; fanouts_start[aig.num_aigpins + 1]];
+        for i in 0..aig.drivers.len() {
+            for_each_fanin(&aig.drivers, &aig.macros, i, |src| {
+                let st = fanouts_start[src] - 1;
+                fanouts_start[src] = st;
+                fanouts[st] = i;
+            });
+        }
+        aig.fanouts_start = fanouts_start;
+        aig.fanouts = fanouts;
+
+        if !aig.macros.is_empty() {
+            let (mut n_c4, mut n_dsp, mut n_srl) = (0, 0, 0);
+            for m in aig.macros.values() {
+                match m.kind {
+                    MacroKind::Carry4 => n_c4 += 1,
+                    MacroKind::Dsp48e2 { .. } => n_dsp += 1,
+                    MacroKind::Srlc32e => n_srl += 1,
                 }
             }
+            clilog::info!(
+                "intercepted {} word-level macros: {} CARRY4, {} DSP48E2, {} SRLC32E",
+                aig.macros.len(), n_c4, n_dsp, n_srl
+            );
+            clilog::info!(
+                "  {} stateful macro endpoints, {} need mid-partition evaluation",
+                aig.stateful_macros.len(),
+                aig.macros.values()
+                    .filter(|m| m.kind.needs_mid_partition_eval()).count()
+            );
         }
 
         aig
+    }
+
+    /// Do any intercepted macros need scheduler support that does not exist
+    /// yet?
+    ///
+    /// Call this from a simulation entry point to fail loudly rather than
+    /// silently producing wrong waveforms.
+    pub fn has_unscheduled_macros(&self) -> bool {
+        !self.macros.is_empty()
     }
 
     pub fn topo_traverse_generic(
@@ -612,14 +777,33 @@ impl AIG {
                 return
             }
             vis.insert(u);
-            if let DriverType::AndGate(a, b) = aig.drivers[u] {
-                if is_primary_input.map(|s| s.contains(&u)) != Some(true) {
-                    if (a >> 1) != 0 {
-                        dfs_topo(aig, vis, ret, is_primary_input, a >> 1);
+            if is_primary_input.map(|s| s.contains(&u)) != Some(true) {
+                match aig.drivers[u] {
+                    DriverType::AndGate(a, b) => {
+                        if (a >> 1) != 0 {
+                            dfs_topo(aig, vis, ret, is_primary_input, a >> 1);
+                        }
+                        if (b >> 1) != 0 {
+                            dfs_topo(aig, vis, ret, is_primary_input, b >> 1);
+                        }
                     }
-                    if (b >> 1) != 0 {
-                        dfs_topo(aig, vis, ret, is_primary_input, b >> 1);
+                    // Macro outputs carry per-slot combinational fan-in. This
+                    // must be traversed or the scheduler will happily emit a
+                    // partition that reads a CARRY4 `S` bit, or an SRLC32E
+                    // address bit, that nothing computed -- a silent
+                    // mis-schedule rather than a crash. Stateful outputs
+                    // (DSP `P`, SRL `Q31`) return an empty fan-in and behave
+                    // as graph leaves, exactly like a DFF `Q`.
+                    DriverType::Macro(cellid, slot) => {
+                        let inst = aig.macros.get(&cellid)
+                            .expect("macro driver without an instance");
+                        let mut fanin = Vec::new();
+                        inst.for_each_comb_fanin(slot, |i| fanin.push(i));
+                        for i in fanin {
+                            dfs_topo(aig, vis, ret, is_primary_input, i);
+                        }
                     }
+                    _ => {}
                 }
             }
             ret.push(u);
@@ -637,19 +821,42 @@ impl AIG {
         ret
     }
 
+    /// Endpoint groups are laid out as four consecutive ranges:
+    ///
+    /// ```text
+    ///   [ primary outputs | DFFs | SRAMs | stateful macros ]
+    /// ```
+    ///
+    /// Stateful macros are appended last so that every pre-existing endpoint
+    /// id keeps its meaning and previously serialized `.gemparts` files stay
+    /// interpretable for macro-free designs.
     pub fn num_endpoint_groups(&self) -> usize {
         self.primary_outputs.len() + self.dffs.len() + self.srams.len()
+            + self.stateful_macros.len()
     }
 
-    pub fn get_endpoint_group(&self, endpt_id: usize) -> EndpointGroup {
-        if endpt_id < self.primary_outputs.len() {
+    pub fn get_endpoint_group(&self, endpt_id: usize) -> EndpointGroup<'_> {
+        let n_po = self.primary_outputs.len();
+        let n_dff = self.dffs.len();
+        let n_sram = self.srams.len();
+        if endpt_id < n_po {
             EndpointGroup::PrimaryOutput(*self.primary_outputs.get_index(endpt_id).unwrap())
         }
-        else if endpt_id < self.primary_outputs.len() + self.dffs.len() {
-            EndpointGroup::DFF(&self.dffs[endpt_id - self.primary_outputs.len()])
+        else if endpt_id < n_po + n_dff {
+            EndpointGroup::DFF(&self.dffs[endpt_id - n_po])
+        }
+        else if endpt_id < n_po + n_dff + n_sram {
+            EndpointGroup::RAMBlock(&self.srams[endpt_id - n_po - n_dff])
         }
         else {
-            EndpointGroup::RAMBlock(&self.srams[endpt_id - self.primary_outputs.len() - self.dffs.len()])
+            let macro_i = self.stateful_macros[endpt_id - n_po - n_dff - n_sram];
+            EndpointGroup::Macro(&self.macros[macro_i])
         }
+    }
+
+    /// The endpoint group id of a stateful macro, given its position in
+    /// [Self::stateful_macros].
+    pub fn macro_endpoint_id(&self, stateful_idx: usize) -> usize {
+        self.primary_outputs.len() + self.dffs.len() + self.srams.len() + stateful_idx
     }
 }

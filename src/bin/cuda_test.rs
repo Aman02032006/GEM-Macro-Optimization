@@ -672,7 +672,11 @@ fn main() {
     let mut input_states_uvec: UVec<_> = input_states.clone().into();
     let device = Device::CUDA(0);
     input_states_uvec.as_mut_uptr(device);
-    let mut sram_storage = UVec::new_zeroed(script.sram_storage_size as usize, device);
+    // SRAM storage with the word-level macro state appended. Macro offsets in
+    // the script are absolute within this combined buffer, which is why the
+    // kernel needs no extra parameter.
+    let mut sram_storage = UVec::new_zeroed(
+        (script.sram_storage_size + script.macro_storage_size) as usize + 2, device);
     device.synchronize();
     let timer_sim = clilog::stimer!("simulation");
     ucci::simulate_v1_noninteractive_simple_scan(

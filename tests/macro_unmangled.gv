@@ -1,0 +1,31 @@
+module top (clk, a_in, b_in, c_in, d_in, p_out, ci, s, di, o, co);
+    input clk;
+    input [26:0] a_in;
+    input [17:0] b_in;
+    input [47:0] c_in;
+    input [26:0] d_in;
+    output [47:0] p_out;
+    input ci;
+    input [3:0] s;
+    input [3:0] di;
+    output [3:0] o;
+    output [3:0] co;
+
+    CARRY4 c4 (
+        .CIN    (ci),
+        .CYINIT (1'b0),
+        .DI     (di),
+        .S      (s),
+        .O      (o),
+        .CO     (co)
+    );
+
+    DSP48E2 dsp_bad (
+        .CLK (clk),
+        .A   (a_in),
+        .B   (b_in),
+        .C   (c_in),
+        .D   (d_in),
+        .P   (p_out)
+    );
+endmodule

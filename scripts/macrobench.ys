@@ -1,0 +1,30 @@
+# Macro-rich micro-benchmark -> AIG netlist with all three macros intact.
+read_verilog -lib scripts/macros_bb.v
+read_verilog test_data/macrobench/macro_bench.v
+hierarchy -check -top macro_bench
+
+proc
+opt_expr
+opt_dff
+opt_clean
+
+memory -nomap
+memory_map
+opt -full
+
+# adders -> CARRY4. LUT_SIZE=6 picks the CARRY4 branch of arith_map.
+alumacc
+opt -full
+techmap -D LUT_SIZE=6 -map +/xilinx/arith_map.v
+opt_clean
+
+techmap
+opt -full
+
+dfflibmap -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+abc -liberty aigpdk/aigpdk_nomem.lib
+opt_clean -purge
+
+write_verilog -noattr -noexpr build/macrobench.gv
+stat

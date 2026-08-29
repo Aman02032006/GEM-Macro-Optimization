@@ -12,6 +12,106 @@ use sverilogparse::SVerilogRange;
 use itertools::Itertools;
 use vcd_ng::{Parser, ScopeItem, Var, Scope, FastFlow, FastFlowToken, FFValueChange, Writer, SimulationCommand};
 use gem::aigpdk::AIGPDKLeafPins;
+use gem::macros::{MacroKind, DspState};
+use gem::macros::{
+    C4_IN_CI, C4_IN_CYINIT, C4_IN_DI, C4_IN_S, C4_OUT_O, C4_OUT_CO,
+    DSP_IN_A, DSP_IN_B, DSP_IN_C, DSP_IN_D, DSP_IN_CEP,
+    SRL_IN_D, SRL_IN_CE, SRL_IN_A, SRL_OUT_Q, SRL_OUT_Q31,
+};
+
+// ---------------------------------------------------------------------------
+// Word-level macro reference evaluation.
+//
+// These are direct ports of the verified C++/CUDA golden models in
+// src/models/{carry4,dsp,srlc32e}_test.cu, and they are the ground truth the
+// whole verification ladder rests on: naive_sim produces reference values,
+// flatten_test proves the emitted script reproduces them, and cuda_test proves
+// the kernel does. Any divergence between these and the .cu models is a bug in
+// one of the two, so keep them textually parallel.
+// ---------------------------------------------------------------------------
+
+/// Gather a macro's input slots out of the netlist pin state.
+///
+/// Slots whose pin is absent from the instantiation fall back to
+/// `MacroKind::default_input`, which is 1 for enable-like pins (CEP, CE) and 0
+/// for data pins -- getting that backwards silently freezes every register.
+fn macro_gather_inputs(
+    netlistdb: &NetlistDB, circ_state: &[u8], cellid: usize, kind: MacroKind
+) -> Vec<u8> {
+    let mut v: Vec<u8> = (0..kind.num_inputs())
+        .map(|s| (kind.default_input(s) & 1) as u8)
+        .collect();
+    for pinid in netlistdb.cell2pin.iter_set(cellid) {
+        let name = netlistdb.pinnames[pinid].1.as_str();
+        let bit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+        if let Some(slot) = kind.input_slot(name, bit) {
+            v[slot] = circ_state[pinid] & 1;
+        }
+    }
+    v
+}
+
+fn bits_to_u64(v: &[u8], base: usize, width: usize) -> u64 {
+    let mut r = 0u64;
+    for i in 0..width {
+        r |= (v[base + i] as u64 & 1) << i;
+    }
+    r
+}
+
+fn sext(v: u64, w: u32) -> i64 {
+    let m = 1u64 << (w - 1);
+    ((v ^ m).wrapping_sub(m)) as i64
+}
+
+/// CARRY4, per the PS: C[0] = CYINIT | CIN, C[i+1] = S[i] ? C[i] : DI[i],
+/// O[i] = S[i] ^ C[i], CO[i] = C[i+1]. Returns (O, CO) as 4-bit values.
+fn eval_carry4(inp: &[u8]) -> (u8, u8) {
+    let mut c = (inp[C4_IN_CI] | inp[C4_IN_CYINIT]) & 1;
+    let (mut o, mut co) = (0u8, 0u8);
+    for i in 0..4 {
+        let s = inp[C4_IN_S + i] & 1;
+        let di = inp[C4_IN_DI + i] & 1;
+        let c_next = if s != 0 { c } else { di };
+        o |= (s ^ c) << i;
+        co |= c_next << i;
+        c = c_next;
+    }
+    (o, co)
+}
+
+/// DSP48E2 simplified subset. Returns the next PREG value as a canonical
+/// zero-extended 48-bit word. AD wraps at 27 bits, M is exact at 45, P wraps
+/// at 48 -- see the header of src/models/dsp_test.cu for why each is so.
+fn eval_dsp_next(
+    inp: &[u8], p_cur: u64, state: DspState, use_preadder: bool
+) -> u64 {
+    const P_MASK: u64 = (1u64 << 48) - 1;
+    let a = sext(bits_to_u64(inp, DSP_IN_A, 27), 27);
+    let b = sext(bits_to_u64(inp, DSP_IN_B, 18), 18);
+    let c = sext(bits_to_u64(inp, DSP_IN_C, 48), 48);
+    let d = sext(bits_to_u64(inp, DSP_IN_D, 27), 27);
+    let cep = inp[DSP_IN_CEP] & 1;
+
+    let ad_raw = if use_preadder { a.wrapping_add(d) } else { a };
+    let ad = sext((ad_raw as u64) & ((1 << 27) - 1), 27);
+    let m = sext((ad.wrapping_mul(b) as u64) & ((1 << 45) - 1), 45);
+    let p = sext(p_cur, 48);
+
+    let p_next = match state {
+        DspState::Bypass => c,
+        DspState::Mult => m,
+        DspState::Mac => p.wrapping_add(m),
+    };
+    if cep != 0 { (p_next as u64) & P_MASK } else { p_cur }
+}
+
+/// SRLC32E shift: on the rising edge, if CE, shift LSB->MSB and load D at 0.
+fn eval_srl_next(inp: &[u8], sr: u32) -> u32 {
+    if (inp[SRL_IN_CE] & 1) == 0 { return sr }
+    (sr << 1) | (inp[SRL_IN_D] as u32 & 1)
+}
+
 
 #[derive(clap::Parser, Debug)]
 struct SimulatorArgs {
@@ -163,8 +263,14 @@ fn main() {
 
     let mut posedge_monitor = HashSet::new();
     for cellid in 1..netlistdb.num_cells {
+        // Clocked word-level macros share the single global clock domain with
+        // DFFs and RAMs. Omitting them here means a design built purely from
+        // macros detects no clock at all and silently never latches.
+        let is_clocked_macro = MacroKind::from_celltype(
+            netlistdb.celltypes[cellid].as_str()
+        ).map(|k| k.has_clock()) == Some(true);
         if matches!(netlistdb.celltypes[cellid].as_str(),
-                    "DFF" | "$__RAMGEM_SYNC_") {
+                    "DFF" | "$__RAMGEM_SYNC_") || is_clocked_macro {
             for pinid in netlistdb.cell2pin.iter_set(cellid) {
                 if matches!(netlistdb.pinnames[pinid].1.as_str(),
                             "CLK" | "PORT_R_CLK" | "PORT_W_CLK") {
@@ -259,6 +365,11 @@ fn main() {
 
     let mut circ_state = vec![0u8; netlistdb.num_pins];
     let mut srams = HashMap::new();
+    // Persistent word-level macro state, keyed by cell id. A DSP holds its
+    // 48-bit PREG here; an SRLC32E holds its 32-bit shift register, which has
+    // no pin representation at all -- only Q and Q31 are visible -- so this is
+    // the only place it exists.
+    let mut macro_state: HashMap<usize, u64> = HashMap::new();
     if let Some(netid) = netlistdb.net_one {
         for pinid in netlistdb.net2pin.iter_set(netid) {
             circ_state[pinid] = 1u8;
@@ -287,6 +398,24 @@ fn main() {
         if netlistdb.celltypes[cellid].as_str() == "$__RAMGEM_SYNC_" {
             srams.insert(cellid, vec![0u32; 1 << 13]);
         }
+        // Word-level macros. Outputs that are pure state reads (DSP P, SRL
+        // Q31) behave exactly like a DFF Q: pre-marked visited so they never
+        // enter `topo`, and driven by the latch phase instead. Outputs that
+        // are combinational (CARRY4 O/CO, SRL Q) stay in `topo`.
+        if let Some(kind) = MacroKind::from_celltype(netlistdb.celltypes[cellid].as_str()) {
+            for pinid in netlistdb.cell2pin.iter_set(cellid) {
+                let name = netlistdb.pinnames[pinid].1.as_str();
+                let bit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+                if let Some(slot) = kind.output_slot(name, bit) {
+                    if !kind.output_needs_mid_partition_eval(slot) {
+                        topo_vis[pinid] = true;
+                    }
+                }
+            }
+            if kind.is_stateful() {
+                macro_state.insert(cellid, 0u64);
+            }
+        }
     }
     fn dfs_topo(netlistdb: &NetlistDB, topo_vis: &mut Vec<bool>, topo_instack: &mut Vec<bool>, topo: &mut Vec<usize>, pinid: usize) {
         if topo_instack[pinid] {
@@ -306,10 +435,37 @@ fn main() {
         }
         else {
             let cellid = netlistdb.pin2cell[pinid];
-            for pinid in netlistdb.cell2pin.iter_set(cellid) {
-                if matches!(netlistdb.pinnames[pinid].1.as_str(),
-                            "A" | "B") {
-                    dfs_topo(netlistdb, topo_vis, topo_instack, topo, pinid);
+            if let Some(kind) = MacroKind::from_celltype(
+                netlistdb.celltypes[cellid].as_str()
+            ) {
+                // Recurse only on this OUTPUT's combinational fan-in, not on
+                // every input of the cell. CARRY4's dependency is triangular
+                // (O[0] cannot see S[3]); an all-to-all recursion would
+                // manufacture a false loop and trip the panic above on a
+                // perfectly legal netlist.
+                let name = netlistdb.pinnames[pinid].1.as_str();
+                let bit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+                let slot = kind.output_slot(name, bit).unwrap_or_else(|| panic!(
+                    "macro cell drives pin {} which is not a declared output",
+                    netlistdb.pinnames[pinid].dbg_fmt_pin()
+                ));
+                let deps = kind.comb_fanin_of_output(slot);
+                for p in netlistdb.cell2pin.iter_set(cellid) {
+                    let pname = netlistdb.pinnames[p].1.as_str();
+                    let pbit = netlistdb.pinnames[p].2.map(|i| i as usize);
+                    if let Some(islot) = kind.input_slot(pname, pbit) {
+                        if deps.contains(&islot) {
+                            dfs_topo(netlistdb, topo_vis, topo_instack, topo, p);
+                        }
+                    }
+                }
+            }
+            else {
+                for pinid in netlistdb.cell2pin.iter_set(cellid) {
+                    if matches!(netlistdb.pinnames[pinid].1.as_str(),
+                                "A" | "B") {
+                        dfs_topo(netlistdb, topo_vis, topo_instack, topo, pinid);
+                    }
                 }
             }
         }
@@ -329,6 +485,25 @@ fn main() {
                 if matches!(netlistdb.pinnames[pinid].1.as_str(),
                             "D" | "PORT_R_ADDR" | "PORT_W_WR_EN" | "PORT_W_ADDR" | "PORT_W_WR_DATA") {
                     dfs_topo(&netlistdb, &mut topo_vis, &mut topo_instack, &mut topo, pinid);
+                }
+            }
+        }
+        // A macro's next-state cone must be evaluated for the latch phase to
+        // have anything to read, so those pins are traversal roots too -- the
+        // exact analogue of a DFF's D pin. The combinational read ports
+        // (CARRY4 O/CO, SRL Q) are reached separately, through whatever
+        // consumes them.
+        if let Some(kind) = MacroKind::from_celltype(
+            netlistdb.celltypes[cellid].as_str()
+        ) {
+            let state_slots = kind.state_fanin();
+            for pinid in netlistdb.cell2pin.iter_set(cellid) {
+                let name = netlistdb.pinnames[pinid].1.as_str();
+                let bit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+                if let Some(slot) = kind.input_slot(name, bit) {
+                    if state_slots.contains(&slot) {
+                        dfs_topo(&netlistdb, &mut topo_vis, &mut topo_instack, &mut topo, pinid);
+                    }
                 }
             }
         }
@@ -459,6 +634,39 @@ fn main() {
                                 }
                             }
                         }
+                        else if let Some(kind) = MacroKind::from_celltype(
+                            netlistdb.celltypes[cellid].as_str()
+                        ) {
+                            if !kind.is_stateful() { continue }
+                            let inp = macro_gather_inputs(
+                                &netlistdb, &circ_state, cellid, kind);
+                            let cur = *macro_state.get(&cellid).unwrap();
+                            let next = match kind {
+                                MacroKind::Dsp48e2 { state, use_preadder } =>
+                                    eval_dsp_next(&inp, cur, state, use_preadder),
+                                MacroKind::Srlc32e =>
+                                    eval_srl_next(&inp, cur as u32) as u64,
+                                MacroKind::Carry4 => unreachable!(),
+                            };
+                            macro_state.insert(cellid, next);
+
+                            // Drive the state-read outputs from the post-edge
+                            // value, matching how DFF Q is handled above.
+                            for pinid in netlistdb.cell2pin.iter_set(cellid) {
+                                let name = netlistdb.pinnames[pinid].1.as_str();
+                                let bit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+                                let Some(slot) = kind.output_slot(name, bit) else { continue };
+                                if kind.output_needs_mid_partition_eval(slot) { continue }
+                                circ_state[pinid] = match kind {
+                                    // P[k] is bit k of PREG
+                                    MacroKind::Dsp48e2 { .. } =>
+                                        ((next >> (slot - gem::macros::DSP_OUT_P)) & 1) as u8,
+                                    // Q31 is the top tap of the shift register
+                                    MacroKind::Srlc32e => ((next >> 31) & 1) as u8,
+                                    MacroKind::Carry4 => unreachable!(),
+                                };
+                            }
+                        }
                     }
                     // propagate
                     for &pinid in &topo {
@@ -476,6 +684,43 @@ fn main() {
                                 //     println!("changing output for pin {} to {}", netlistdb.pinnames[pinid].dbg_fmt_pin(), circ_state[pinid]);
                                 // }
                             }
+                        }
+                        else if let Some(kind) = MacroKind::from_celltype(
+                            netlistdb.celltypes[netlistdb.pin2cell[pinid]].as_str()
+                        ) {
+                            // Combinational macro read ports. Recomputing the
+                            // whole macro per output pin is redundant but
+                            // idempotent, and this is the reference model --
+                            // clarity beats speed here.
+                            let cellid = netlistdb.pin2cell[pinid];
+                            let inp = macro_gather_inputs(
+                                &netlistdb, &circ_state, cellid, kind);
+                            let name = netlistdb.pinnames[pinid].1.as_str();
+                            let bit = netlistdb.pinnames[pinid].2.map(|i| i as usize);
+                            let slot = kind.output_slot(name, bit).unwrap();
+                            circ_state[pinid] = match kind {
+                                MacroKind::Carry4 => {
+                                    let (o, co) = eval_carry4(&inp);
+                                    if slot < C4_OUT_CO {
+                                        (o >> (slot - C4_OUT_O)) & 1
+                                    } else {
+                                        (co >> (slot - C4_OUT_CO)) & 1
+                                    }
+                                },
+                                MacroKind::Srlc32e => {
+                                    let sr = *macro_state.get(&cellid).unwrap() as u32;
+                                    let a = (0..5).fold(0u32, |acc, i|
+                                        acc | ((inp[SRL_IN_A + i] as u32 & 1) << i));
+                                    match slot {
+                                        SRL_OUT_Q => ((sr >> a) & 1) as u8,
+                                        SRL_OUT_Q31 => ((sr >> 31) & 1) as u8,
+                                        _ => unreachable!()
+                                    }
+                                },
+                                // P is a state read, handled in the latch
+                                // phase and never present in `topo`.
+                                MacroKind::Dsp48e2 { .. } => unreachable!(),
+                            };
                         }
                         else {
                             let cellid = netlistdb.pin2cell[pinid];

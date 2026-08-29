@@ -6,6 +6,7 @@ use gem::aig::{DriverType, AIG};
 use gem::staging::build_staged_aigs;
 use gem::pe::{Partition, BOOMERANG_NUM_STAGES};
 use gem::flatten::FlattenedScriptV1;
+use gem::macros::*;
 use netlistdb::{Direction, GeneralPinName, NetlistDB};
 use sverilogparse::SVerilogRange;
 use compact_str::CompactString;
@@ -63,6 +64,99 @@ fn hash_of<T: Hash>(x: &T) -> u64 {
 }
 
 /// CPU prototype partition executor for script version 1.
+/// Evaluate one mid-partition macro phase, mirroring the emitted script
+/// exactly.
+///
+/// The carry chain is walked sequentially here; on the GPU the same result
+/// comes out of a Kogge-Stone `__shfl_up_sync` scan. Any divergence between
+/// the two is a kernel bug, which is precisely what this oracle exists to
+/// localise.
+fn run_macro_phase(
+    script: &[u32], script_pi: usize,
+    state: &mut Vec<u32>, macro_data: &mut [u32],
+) {
+    let read_bit = |st: &Vec<u32>, pos: usize| -> u8 {
+        ((st[pos >> 5] >> (pos & 31)) & 1) as u8
+    };
+    let mut prev_co3: u8 = 0;
+    for lane in 0..MACRO_MAX_LANES {
+        let base = script_pi + lane * MACRO_LANE_WORDS;
+        let desc = script[base];
+        if (desc >> MACRO_DESC_VALID_BIT) & 1 == 0 {
+            prev_co3 = 0;
+            continue
+        }
+        let kind = desc & MACRO_DESC_KIND_MASK;
+        let chain_start = ((desc >> MACRO_DESC_CHAIN_START_BIT) & 1) != 0;
+        let state_off = (desc >> MACRO_DESC_STATE_SHIFT) as usize;
+
+        let mut inp = [0u8; MACRO_LANE_IN_SLOTS];
+        for w in 0..(MACRO_LANE_IN_SLOTS / 2) {
+            let word = script[base + 1 + w];
+            inp[w * 2] = macro_decode_input(
+                word as u16, |pos| read_bit(state, pos));
+            inp[w * 2 + 1] = macro_decode_input(
+                (word >> 16) as u16, |pos| read_bit(state, pos));
+        }
+        let mut outs = [MACRO_POS_NONE; MACRO_LANE_OUT_SLOTS];
+        for w in 0..(MACRO_LANE_OUT_SLOTS / 2) {
+            let word = script[base + 1 + MACRO_LANE_IN_SLOTS / 2 + w];
+            outs[w * 2] = word as u16;
+            outs[w * 2 + 1] = (word >> 16) as u16;
+        }
+
+        let mut put = |st: &mut Vec<u32>, slot: usize, v: u8| {
+            let pos = outs[slot];
+            if pos == MACRO_POS_NONE { return }
+            let pos = pos as usize;
+            st[pos >> 5] = (st[pos >> 5] & !(1u32 << (pos & 31)))
+                | ((v as u32 & 1) << (pos & 31));
+        };
+
+        match kind {
+            MACRO_KIND_CARRY4 => {
+                // a scanned link takes its carry from the previous lane
+                let ci = if chain_start { inp[C4_IN_CI] } else { prev_co3 };
+                let mut c = (ci | inp[C4_IN_CYINIT]) & 1;
+                for i in 0..4 {
+                    let sb = inp[C4_IN_S + i] & 1;
+                    let db = inp[C4_IN_DI + i] & 1;
+                    let cn = if sb != 0 { c } else { db };
+                    put(state, C4_OUT_O + i, sb ^ c);
+                    put(state, C4_OUT_CO + i, cn);
+                    c = cn;
+                }
+                prev_co3 = c;
+            },
+            MACRO_KIND_SRLC32E => {
+                // Read strictly before the shift. Both output taps observe
+                // the PRE-edge register, and the committed value only becomes
+                // visible on the next cycle -- the same D-to-Q relationship a
+                // DFF has, which is what keeps this consistent with
+                // naive_sim's latch-before-propagate ordering.
+                let sr = macro_data[state_off];
+                let a = (0..5).fold(0u32, |acc, i|
+                    acc | ((inp[SRL_IN_A + i] as u32 & 1) << i));
+                put(state, SRL_OUT_Q, ((sr >> a) & 1) as u8);
+                put(state, SRL_OUT_Q31, ((sr >> 31) & 1) as u8);
+                if (inp[SRL_IN_CE] & 1) != 0 {
+                    macro_data[state_off] = (sr << 1) | (inp[SRL_IN_D] as u32 & 1);
+                }
+                prev_co3 = 0;
+            },
+            k @ _ => panic!("unknown macro kind code {} in script", k),
+        }
+    }
+}
+
+const DSP_P_MASK: u64 = (1u64 << 48) - 1;
+
+/// Sign-extend the low `w` bits of `v`.
+fn sext_i(v: u64, w: u32) -> i64 {
+    let m = 1u64 << (w - 1);
+    ((v & ((1u64 << w) - 1)) ^ m).wrapping_sub(m) as i64
+}
+
 fn simulate_block_v1(
     script: &[u32],
     input_state: &[u32], output_state: &mut [u32],
@@ -84,6 +178,13 @@ fn simulate_block_v1(
         let sram_offset = script[script_pi + 5];
         let num_global_read_rounds = script[script_pi + 6];
         let num_output_duplicates = script[script_pi + 7];
+        let num_macro_phases = script[script_pi + 8] as usize;
+        let num_dsps = script[script_pi + 9];
+        let dsp_state_base = script[script_pi + 10];
+        let dsp_words = num_dsps * 2;
+        let macro_phase_hdr: Vec<u32> = (0..num_macro_phases)
+            .map(|i| script[script_pi + 11 + i]).collect();
+        let mut macro_ph_cursor = 0usize;
         let mut writeout_hooks = vec![0; 256];
         for i in 0..128 {
             let t = script[script_pi + 128 + i];
@@ -99,7 +200,8 @@ fn simulate_block_v1(
         part_i_dbg += 1;
         // println!("part start");
         assert_eq!(part.stages.len(), num_stages as usize);
-        assert_eq!(part.stages.iter().map(|s| s.write_outs.len()).sum::<usize>(), (num_ios - num_srams - num_output_duplicates) as usize);
+        // num_ios now also covers DSP P write-out words.
+        assert_eq!(part.stages.iter().map(|s| s.write_outs.len()).sum::<usize>(), (num_ios - num_srams - num_output_duplicates - dsp_words) as usize);
         script_pi += 256;
         let mut writeouts = vec![0u32; num_ios as usize];
 
@@ -131,6 +233,13 @@ fn simulate_block_v1(
         parts_input_hashes[part_index] = hash_of(&state);
 
         for bs_i in 0..num_stages {
+            while macro_ph_cursor < num_macro_phases &&
+                (macro_phase_hdr[macro_ph_cursor] >> 16) == bs_i
+            {
+                run_macro_phase(script, script_pi, &mut state, sram_data);
+                script_pi += MACRO_MAX_LANES * MACRO_LANE_WORDS;
+                macro_ph_cursor += 1;
+            }
             let mut hier_inputs = vec![0; 256];
             let mut hier_flag_xora = vec![0; 256];
             let mut hier_flag_xorb = vec![0; 256];
@@ -232,9 +341,16 @@ fn simulate_block_v1(
             }
         }
 
-        let mut sram_duplicate_perm = vec![0u32; (num_srams * 4 + num_output_duplicates) as usize];
+        while macro_ph_cursor < num_macro_phases {
+            run_macro_phase(script, script_pi, &mut state, sram_data);
+            script_pi += MACRO_MAX_LANES * MACRO_LANE_WORDS;
+            macro_ph_cursor += 1;
+        }
+
+        let num_gather_lanes = num_srams * 4 + num_dsps * 4 + num_output_duplicates;
+        let mut sram_duplicate_perm = vec![0u32; num_gather_lanes as usize];
         for k_outer in 0..4 {
-            for i in 0..(num_srams * 4 + num_output_duplicates) {
+            for i in 0..num_gather_lanes {
                 for k_inner in 0..4 {
                     let k = k_outer * 4 + k_inner;
                     let t_shuffle = script[script_pi + (i * 4 + k_inner) as usize];
@@ -246,7 +362,7 @@ fn simulate_block_v1(
             }
             script_pi += 256 * 4;
         }
-        for i in 0..(num_srams * 4 + num_output_duplicates) as usize {
+        for i in 0..num_gather_lanes as usize {
             sram_duplicate_perm[i] &= !script[script_pi + i * 4 + 1];
             sram_duplicate_perm[i] ^= script[script_pi + i * 4];
         }
@@ -270,9 +386,54 @@ fn simulate_block_v1(
             // println!("sram for part id {} index {sram_i_u32}: port_r_addr_iv {port_r_addr_iv} port_w_addr_iv {port_w_addr_iv} port_w_wr_en {port_w_wr_en} port_w_wr_data_iv {port_w_wr_data_iv}", parts_indices[part_i_dbg - 1]);
         }
 
+        // DSP48E2 commit. Mirrors the SRAM block above: inputs arrive through
+        // the gather permutation, the macro unit evaluates, and the 48 result
+        // bits go into write-out slots that input_map points at.
+        for dsp_i in 0..num_dsps {
+            let g = (num_srams * 4 + dsp_i * 4) as usize;
+            let w = [sram_duplicate_perm[g], sram_duplicate_perm[g + 1],
+                     sram_duplicate_perm[g + 2], sram_duplicate_perm[g + 3]];
+            let gb = |i: usize| ((w[i >> 5] >> (i & 31)) & 1) as u64;
+            let fld = |base: usize, width: usize| -> u64 {
+                (0..width).fold(0u64, |acc, i| acc | (gb(base + i) << i))
+            };
+            let a = sext_i(fld(DSP_IN_A, 27), 27);
+            let b = sext_i(fld(DSP_IN_B, 18), 18);
+            let c = sext_i(fld(DSP_IN_C, 48), 48);
+            let d = sext_i(fld(DSP_IN_D, 27), 27);
+            let cep = gb(DSP_IN_CEP) != 0;
+            let clken = gb(DSP_NUM_INPUTS) != 0;
+            let st_code = (gb(DSP_NUM_INPUTS + 1) | (gb(DSP_NUM_INPUTS + 2) << 1)) as u32;
+            let preadd = gb(DSP_NUM_INPUTS + 3) != 0;
+
+            let off = (dsp_state_base + dsp_i * 2) as usize;
+            let p_cur = ((sram_data[off] as u64)
+                | ((sram_data[off + 1] as u64) << 32)) & DSP_P_MASK;
+
+            let p_next = if clken && cep {
+                let ad = sext_i(((if preadd { a.wrapping_add(d) } else { a }) as u64)
+                                & ((1u64 << 27) - 1), 27);
+                let m = sext_i((ad.wrapping_mul(b) as u64) & ((1u64 << 45) - 1), 45);
+                let v = match st_code {
+                    0 => c,
+                    1 => m,
+                    2 => sext_i(p_cur, 48).wrapping_add(m),
+                    _ => sext_i(p_cur, 48),
+                };
+                (v as u64) & DSP_P_MASK
+            } else { p_cur };
+
+            sram_data[off] = p_next as u32;
+            sram_data[off + 1] = ((p_next >> 32) & 0xffff) as u32;
+            let wb = (num_ios - num_srams - num_output_duplicates
+                      - dsp_words + dsp_i * 2) as usize;
+            writeouts[wb] = p_next as u32;
+            writeouts[wb + 1] = ((p_next >> 32) & 0xffff) as u32;
+        }
+
         for i in 0..num_output_duplicates {
             writeouts[(num_ios - num_srams - num_output_duplicates + i) as usize] =
-                sram_duplicate_perm[(num_srams * 4 + i) as usize];
+                sram_duplicate_perm[(num_srams * 4 + num_dsps * 4 + i) as usize];
         }
 
         let mut clken_perm = vec![0u32; num_ios as usize];
@@ -582,7 +743,9 @@ fn main() {
 
     // do simulation
     let mut state = vec![0; script.reg_io_state_size as usize];
-    let mut sram_storage = vec![0; script.sram_storage_size as usize];
+    // SRAM storage with word-level macro state appended; macro offsets in the
+    // script are absolute within this combined buffer.
+    let mut sram_storage = vec![0u32; (script.sram_storage_size + script.macro_storage_size) as usize + 2];
 
     // the simulator keeps 2 previous timestamps.
     // vcd_time: the last seen timestamp.

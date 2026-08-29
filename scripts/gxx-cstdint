@@ -1,0 +1,32 @@
+#!/bin/sh
+# Host C++ compiler shim for the GEM build.
+#
+# 1) <cstdint>
+# GCC 13+ stopped including <cstdint> transitively. mt-kahypar-sc 0.2.0 relies
+# on the old behaviour (e.g. mt-kahypar/utils/memory_tree.h declares
+# `enum class OutputType : uint8_t` with no include), so it fails to compile on
+# GCC 13 and newer. Ubuntu 25.10 ships GCC 15.
+#
+# mt-kahypar is a crates.io dependency vendored under ~/.cargo/registry, so
+# editing its source is neither committable nor portable. Setting CXXFLAGS
+# globally does fix it, but the `cc` crate forwards CXXFLAGS into nvcc too, as
+# `-Xcompiler -include -Xcompiler cstdint`, which breaks CUDA compilation.
+# `cc` resolves the CUDA compiler from $NVCC and the host C++ compiler from
+# $CXX independently, so overriding only $CXX scopes the fix to the C++ tree.
+#
+# 2) NDEBUG
+# mt-kahypar's build.rs sets .debug(false).opt_level(3) but never defines
+# NDEBUG, so it is compiled at release speed with debug assertions still live
+# -- a configuration upstream's CMake never ships. That makes its initial
+# partitioner abort on degenerate hypergraphs:
+#
+#   initial_partitioning_data_container.h:512:
+#   Assertion `std::is_heap(_best_partitions.begin(), ...)' failed
+#
+# Defining NDEBUG matches upstream's release build. GEM independently validates
+# every partition it is handed (Partition::build_one returns None and the
+# clustering is retried), so partition quality remains checked on our side.
+#
+# Wired up in .cargo/config.toml. Override the underlying compiler with
+# GEM_HOST_CXX if you need a different one.
+exec "${GEM_HOST_CXX:-g++}" -include cstdint -DNDEBUG "$@"
