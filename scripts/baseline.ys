@@ -1,3 +1,8 @@
+# NOTE: this script targets a small MIPS processor that is NOT bundled with
+# this repository, so it will not run as-is. It is kept as a reference for how
+# the macro-interception passes are applied to a real design. For a script you
+# can run immediately, see macrobench.ys / macrobench_base.ys.
+#
 # Baseline: MIPS -> pure AIG netlist, no word-level macros.
 # This is the reference GEM maps and simulates for the Deliverable D comparison.
 

@@ -311,9 +311,11 @@ Each rung isolates one layer. If `naive_sim` and `flatten_test` agree but the GP
 | 2 lanes | ~500 | 268 |
 | 4 lanes | ~1,000 | 264 |
 | 16 lanes | 3,876 | 259 |
-| MIPS | 70,000 | 259–261 |
+| MIPS † | 70,000 | 259–261 |
 
-A 500-cell design overflowed **just as hard** as a 70,000-cell one. A genuine capacity limit scales with size. This was flat — so it was a leak, not a limit.
+† Measured during development on a small MIPS processor that is **not bundled** with this repository. The first three rows reproduce from `test_data/macrobench/` by varying the `LANES` parameter.
+
+A 500-cell design overflowed **just as hard** as a 70,000-cell one. A genuine capacity limit scales with size. This was flat — so it was a leak, not a limit. The three bundled rows alone establish this over an 8× size range; the MIPS row extends it to 140×.
 
 **The cause.** In `build_one_boomerang_stage`, when a certain condition holds the code walks **every** 32-slot group in `hier[1]` — about 128 of them — and unconditionally charges one write-out for each, *even after the last endpoint has been placed and the inner loop exits immediately*. Two stages × 128 ≈ 256, which is exactly the cap.
 
@@ -351,9 +353,11 @@ The comment says "ignoring the error". It is not ignoring it; it is silently ali
 
 **Impact beyond our project.** Unmodified GEM silently corrupts results on any netlist containing a constant-D flip-flop. This has nothing to do with macros. If the hidden benchmarks contain one, stock GEM is wrong too.
 
-## 3.4 Stock GEM Bug #3 (bonus) — mt-kahypar built with assertions live
+## 3.4 Dependency bug (bonus) — mt-kahypar built with assertions live
 
-GEM uses `mt-kahypar` for graph partitioning. Its build script sets `.debug(false).opt_level(3)` but **never defines `NDEBUG`** — so it compiles at release speed with debug assertions still active, a configuration upstream's own CMake never ships.
+**This one is not GEM's.** It sits in `mt-kahypar-sc`, the third-party crates.io package GEM uses for graph partitioning, so it is a bug in a dependency rather than in NVIDIA's code. We list it because it blocked us and the fix belongs in this repository, not because it counts against upstream.
+
+That crate's build script sets `.debug(false).opt_level(3)` but **never defines `NDEBUG`** — so it compiles at release speed with debug assertions still active, a configuration upstream's own CMake never ships.
 
 The result, on a degenerate hypergraph:
 
@@ -464,8 +468,17 @@ Design: 16 MAC lanes — **104 CARRY4, 16 DSP48E2, 32 SRLC32E**, 41 simulated cy
 | DRAM throughput | 52.79 % | **0.24 %** | **220× less** |
 | SM occupancy | 33.33 % | 33.33 % | unchanged |
 | Warp divergence | 28.77 / 32 | 21.10 / 32 | *worse* |
-| AND2 gates | 15,177 | 3,376 | 4.5× fewer |
-| **GEM script size** | 15.1 MB | **529 KB** | **28.5× smaller** |
+| AND2 gates | 15,177 | 3,358 | 4.5× fewer |
+| **Per-cycle GPU script** | 2.58 MiB | **179 KiB** | **14.8× smaller** |
+| `.gemparts` compile artifact | 15.1 MB | 529 KB | 28.5× smaller |
+
+### Which size figure matters
+
+These last two rows measure different things, and only the first is the bandwidth story.
+
+The **per-cycle script** is `blocks_data`, the `u32` array the kernel re-reads from global memory on *every* simulated cycle. `cuda_test` reports its length directly (`script size 676352` → `45824` words, ×4 bytes). This is the number that sets DRAM traffic.
+
+The **`.gemparts` file** is the serialised partition description that `cut_map_interactive` writes to disk. It is read once at startup and never touched again during simulation. It shrinks more dramatically (28.5×) because it carries per-gate bookkeeping the runtime script does not, but that reduction costs nothing at run time and must not be quoted as a bandwidth gain.
 
 ### Why occupancy did not change
 
@@ -479,7 +492,9 @@ Warp divergence got **worse**: 28.77 → 21.10 threads per instruction (32 is pe
 
 **Why.** In a warp, all 32 threads execute in lockstep. If only some have work, the rest idle. The boomerang tree it replaced was perfectly uniform — every thread doing an identical AND. Our macro phase activates only a subset of lanes (one per macro), so fewer threads are busy per instruction.
 
-**Why we accept it.** The workload was **DRAM-bound at 52.79 %**, not compute-bound. Trading idle arithmetic units — which were already idle — for a 220× reduction in memory traffic is straightforwardly the right trade on this hardware.
+**Why we accept it.** The workload was **DRAM-bound at 52.79 %**, not compute-bound. Trading idle arithmetic units — which were already idle — for a 14.8× cut in per-cycle memory traffic is straightforwardly the right trade on this hardware.
+
+**On the 220× figure.** DRAM *utilisation* fell 220× (52.79 % → 0.24 %), which is far more than the 14.8× reduction in script bytes. The two are not the same measurement and we do not present the larger one as a traffic reduction. The most likely reason utilisation collapses super-linearly is the cache. This GPU's L2 measures **1.5 MiB** (queried via `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`). The 2.58 MiB baseline script does not fit and must be re-fetched from DRAM every cycle; the 179 KiB macro script fits with room to spare and can be served from L2 after the first cycle. That threshold being crossed explains why utilisation falls further than byte count alone predicts. We did not instrument L2 hit rate directly, so this is the probable mechanism rather than a measured result.
 
 We report this openly. The problem statement asks for "minimal thread divergence", and on that specific metric **we did not achieve it**. We achieved something more valuable for this bottleneck, and the honest framing is a conscious trade rather than a win on every axis.
 
@@ -499,7 +514,7 @@ Two things this establishes:
 
 ### An inference we are careful not to overstate
 
-The chain is coherent — baseline is memory-bound → macros shrink the script 28.5× → DRAM utilisation collapses → throughput rises 1.59×. On a design already at 89 % DRAM utilisation, the headroom to recover is *larger* than on our 52.79 % micro-benchmark.
+The chain is coherent — baseline is memory-bound → macros shrink the per-cycle script 14.8× → DRAM utilisation collapses → throughput rises 1.59×. On a design already at 89 % DRAM utilisation, the headroom to recover is *larger* than on our 52.79 % micro-benchmark.
 
 **But that is a prediction, not a measurement.** We cannot demonstrate it on Rocket, because the dataset ships post-AIG netlists with no RTL to intercept macros from. The honest statement is:
 
@@ -549,7 +564,7 @@ The measured **1.59×** stands on the micro-benchmark alone. We do not blend the
 ## Deliverable E — Documentation & Report (10 pts)
 
 - ✅ **This manual**, covering the scheduling model, memory layout, CUDA architecture and numerical analysis.
-- ✅ **Three bugs in NVIDIA's own code** identified, explained and fixed — one of which silently corrupts results with no error message.
+- ✅ **Two bugs in NVIDIA's own code** identified, explained and fixed — one of which silently corrupts results with no error message — plus a third in the `mt-kahypar` dependency.
 - ✅ **Limitations documented honestly**, with exact failure signatures.
 
 ---

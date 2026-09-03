@@ -8,3 +8,5 @@
 *.vcd
 *.deb
 *:Zone.Identifier
+__pycache__/
+*.pyc

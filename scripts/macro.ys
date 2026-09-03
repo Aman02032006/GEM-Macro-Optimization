@@ -1,3 +1,8 @@
+# NOTE: this script targets a small MIPS processor that is NOT bundled with
+# this repository, so it will not run as-is. It is kept as a reference for how
+# the macro-interception passes are applied to a real design. For a script you
+# can run immediately, see macrobench.ys / macrobench_base.ys.
+#
 # Optimized: MIPS with word-level macros intercepted and left intact.
 #
 # Blackbox declarations must be read FIRST so Yosys knows the macro ports and

@@ -14,7 +14,7 @@
 #   smsp__thread_inst_executed_per_inst...  warp divergence (32 = no divergence)
 set -u
 NAME=$1; GV=$2; PARTS=$3; VCD=$4; BLOCKS=$5
-ROOT="/home/aman0/projects/GEM Optimization/GEM"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NCU=/usr/local/cuda/bin/ncu
 cd "$ROOT" || exit 1
 
